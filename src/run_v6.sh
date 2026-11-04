@@ -74,6 +74,7 @@ BACKOFF_BASE="$V6_BACKOFF_BASE"; [ -z "$BACKOFF_BASE" ] && BACKOFF_BASE=120
 BACKOFF_CAP="$V6_BACKOFF_CAP"; [ -z "$BACKOFF_CAP" ] && BACKOFF_CAP=600
 LAT_TIMEOUT="$V6_LAT_TIMEOUT"; [ -z "$LAT_TIMEOUT" ] && LAT_TIMEOUT=1
 IPS_PER_SEG="$V6_IPS_PER_SEG"; [ -z "$IPS_PER_SEG" ] && IPS_PER_SEG=200
+LOCAL_IPS_PER_SEG="$V6_LOCAL_IPS_PER_SEG"; [ -z "$LOCAL_IPS_PER_SEG" ] && LOCAL_IPS_PER_SEG=20
 LAT_THREAD="$V6_LAT_THREAD"; [ -z "$LAT_THREAD" ] && LAT_THREAD=32
 DIV_SEG_MAX="$V6_DIV_SEG_MAX"; [ -z "$DIV_SEG_MAX" ] && DIV_SEG_MAX=2
 DIV_COLO_MAX="$V6_DIV_COLO_MAX"; [ -z "$DIV_COLO_MAX" ] && DIV_COLO_MAX=3
@@ -485,10 +486,11 @@ fi
 #     非 nibble 对齐掩码（如 /50）在过渡位保留高位、低位随机；/48 全段均匀采样；
 #     段内去重；urandom+md5 种子（同 1d，规避 busybox srand 大数截断坑）
 EXPCNT=0
-if [ $((SEGTOTAL + LOCALCNT)) -gt 0 ] && [ "$IPS_PER_SEG" -gt 0 ]; then
+# 订阅段展开：学习段 + 随机段，每条 IPS_PER_SEG 个段内随机 IP
+if [ "$SEGTOTAL" -gt 0 ] && [ "$IPS_PER_SEG" -gt 0 ]; then
     RSEED=$(head -c 8 /dev/urandom 2>/dev/null | md5sum 2>/dev/null | cut -c1-8)
     [ -z "$RSEED" ] && RSEED="1a2b3c4d"
-    cat "$V6DIR/.seg.keep" "$V6DIR/.seg.pick" "$V6DIR/.seg.local.norm" 2>/dev/null \
+    cat "$V6DIR/.seg.keep" "$V6DIR/.seg.pick" 2>/dev/null \
         | grep -E '^[0-9a-fA-F:]+:/[0-9]+$' \
         | awk -v n="$IPS_PER_SEG" -v hx="$RSEED" '
     function pad4(s) { while (length(s) < 4) s = "0" s; return s }
@@ -539,6 +541,63 @@ if [ $((SEGTOTAL + LOCALCNT)) -gt 0 ] && [ "$IPS_PER_SEG" -gt 0 ]; then
     }' > "$V6DIR/.seg.exp" 2>/dev/null
     EXPCNT=$(grep -c . "$V6DIR/.seg.exp" 2>/dev/null); [ -z "$EXPCNT" ] && EXPCNT=0
 fi
+# 本地优选段展开：手写 CIDR 段（.seg.local.norm），每条 LOCAL_IPS_PER_SEG 个段内随机 IP。
+# 手写段 = 人工优选段，无需像订阅段那样大量撒网；且确定性全进，段数多时靠独立配置控制总量
+LEXPCNT=0
+if [ "$LOCALCNT" -gt 0 ] && [ "$LOCAL_IPS_PER_SEG" -gt 0 ]; then
+    RSEEDL=$(head -c 8 /dev/urandom 2>/dev/null | md5sum 2>/dev/null | cut -c1-8)
+    [ -z "$RSEEDL" ] && RSEEDL="1a2b3c4d"
+    cat "$V6DIR/.seg.local.norm" 2>/dev/null \
+        | grep -E '^[0-9a-fA-F:]+:/[0-9]+$' \
+        | awk -v n="$LOCAL_IPS_PER_SEG" -v hx="$RSEEDL" '
+    function pad4(s) { while (length(s) < 4) s = "0" s; return s }
+    function h2d(s,   i,c,r) { r=0; for(i=1;i<=length(s);i++){c=index("0123456789abcdef",tolower(substr(s,i,1)))-1; r=r*16+c} return r }
+    function expand6(a,   p,nl,nr,i,out) {
+        for (i=1;i<=8;i++) g[i]="0000"
+        p = index(a, "::")
+        if (p > 0) {
+            nl = split(substr(a,1,p-1), L, ":"); nr = split(substr(a,p+2), R, ":")
+            for (i=1;i<=nl;i++) g[i] = pad4(tolower(L[i]))
+            for (i=1;i<=nr;i++) g[8-nr+i] = pad4(tolower(R[i]))
+        } else {
+            nl = split(a, L, ":")
+            if (nl != 8) return ""
+            for (i=1;i<=nl;i++) g[i] = pad4(tolower(L[i]))
+        }
+        out = ""
+        for (i=1;i<=8;i++) out = out g[i]
+        return (length(out) == 32) ? out : ""
+    }
+    BEGIN { srand(h2d(hx)) }
+    {
+        split($0, a, "/")
+        plen = a[2] + 0
+        full = expand6(a[1])
+        if (full == "" || plen > 128 || plen < 48) next
+        keep = int(plen / 4); part = plen % 4
+        cnt = 0; tries = 0
+        while (cnt < n && tries < n * 10) {
+            tries++
+            out = substr(full, 1, keep)
+            for (j = keep + 1; j <= 32; j++) {
+                d = int(rand() * 16)
+                if (j == keep + 1 && part > 0) {
+                    pow = 2 ^ part
+                    d = int(h2d(substr(full, j, 1)) / pow) * pow + int(rand() * pow)
+                }
+                out = out substr("0123456789abcdef", d + 1, 1)
+            }
+            key = ""
+            for (j = 1; j <= 8; j++) key = key substr(out, (j-1)*4+1, 4) ":"
+            if (key in got) continue
+            got[key] = 1; cnt++
+            res = ""
+            for (j = 1; j <= 8; j++) res = res substr(out, (j-1)*4+1, 4) (j < 8 ? ":" : "")
+            print res
+        }
+    }' > "$V6DIR/.seg.exp.local" 2>/dev/null
+    LEXPCNT=$(grep -c . "$V6DIR/.seg.exp.local" 2>/dev/null); [ -z "$LEXPCNT" ] && LEXPCNT=0
+fi
 # 1e. 外部 IP 抽样：IP 通道候选去重后随机抽 IP_PICK 条直接入池（cfst 按 /128 原样测）
 IPCNT=0
 if [ "$IP_PICK" -gt 0 ] && [ -s "$V6DIR/.ips.all" ]; then
@@ -554,8 +613,8 @@ if [ "$IP_PICK" -gt 0 ] && [ -s "$V6DIR/.ips.all" ]; then
 fi
 # 池组装：段展开生效时 pool = 展开随机 IP + 自建池 + 外部 IP（全部裸 IP，量精确可控）；
 # 展开关闭（IPS_PER_SEG=0）或失败时回退旧行为：段 CIDR 原样交给 cfst 随机游走
-if [ "$EXPCNT" -gt 0 ]; then
-    cat "$V6DIR/.seg.exp" "$V6DIR/.learn.ips" "$V6DIR/.p3.tgt" "$V6DIR/.p3" "$V6DIR/.ips.pick" 2>/dev/null \
+if [ $((EXPCNT + LEXPCNT)) -gt 0 ]; then
+    cat "$V6DIR/.seg.exp" "$V6DIR/.seg.exp.local" "$V6DIR/.learn.ips" "$V6DIR/.p3.tgt" "$V6DIR/.p3" "$V6DIR/.ips.pick" 2>/dev/null \
         | grep -E '^([0-9a-fA-F:]+:[0-9a-fA-F]*|[0-9a-fA-F:]+:/[0-9]+)$' \
         | sort -u > "$V6DIR/pool.txt"
 else
@@ -565,8 +624,8 @@ else
 fi
 PCNT=$(grep -c . "$V6DIR/pool.txt" 2>/dev/null)
 [ -z "$PCNT" ] && PCNT=0
-echo "[$(date '+%m-%d %H:%M:%S')]池构建：细分段源 $SEGCNT 段（学习段 $LEARNED + 随机段 $PICKED = $SEGTOTAL）+ 本地优选段 $LOCALCNT 段 → 展开 $EXPCNT 个段内随机 IP + 学习复测 $LIPCNT 个 + 定向 $TGCNT 个 + 自建池 $SCNT 条 + 外部IP $IPCNT 条 → pool.txt 共 $PCNT 行" >> "$LOG"
-rm -f "$V6DIR/.seg.all" "$V6DIR/.seg.local" "$V6DIR/.seg.local.norm" "$V6DIR/.seg.learn" "$V6DIR/.seg.keep" "$V6DIR/.seg.rest" "$V6DIR/.seg.rest0" "$V6DIR/.seg.pick" "$V6DIR/.seg.exp" "$V6DIR/.learn.ips" "$V6DIR/.p3" "$V6DIR/.p3.tgt" "$V6DIR/.seg.keyed" "$V6DIR/.ips.all" "$V6DIR/.ips.pick"
+echo "[$(date '+%m-%d %H:%M:%S')]池构建：细分段源 $SEGCNT 段（学习段 $LEARNED + 随机段 $PICKED = $SEGTOTAL）+ 本地优选段 $LOCALCNT 段 → 展开 $EXPCNT 个段内随机 IP + 本地段展开 $LEXPCNT 个 + 学习复测 $LIPCNT 个 + 定向 $TGCNT 个 + 自建池 $SCNT 条 + 外部IP $IPCNT 条 → pool.txt 共 $PCNT 行" >> "$LOG"
+rm -f "$V6DIR/.seg.all" "$V6DIR/.seg.local" "$V6DIR/.seg.local.norm" "$V6DIR/.seg.learn" "$V6DIR/.seg.keep" "$V6DIR/.seg.rest" "$V6DIR/.seg.rest0" "$V6DIR/.seg.pick" "$V6DIR/.seg.exp" "$V6DIR/.seg.exp.local" "$V6DIR/.learn.ips" "$V6DIR/.p3" "$V6DIR/.p3.tgt" "$V6DIR/.seg.keyed" "$V6DIR/.ips.all" "$V6DIR/.ips.pick"
 
 if [ "$PCNT" -eq 0 ]; then
     echo "[$(date '+%m-%d %H:%M:%S')]池为空（细分段源失效且无历史），本轮退出，$RESULT_FILE 保留上次值" >> "$LOG"

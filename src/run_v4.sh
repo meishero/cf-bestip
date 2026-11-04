@@ -71,6 +71,7 @@ WAIT_MAX="$V4_429_WAIT_MAX"; BACKOFF_ENABLE="$V4_BACKOFF_ENABLE"
 BACKOFF_BASE="$V4_BACKOFF_BASE"; [ -z "$BACKOFF_BASE" ] && BACKOFF_BASE=120
 BACKOFF_CAP="$V4_BACKOFF_CAP"; [ -z "$BACKOFF_CAP" ] && BACKOFF_CAP=600
 IPS_PER_SEG="$V4_IPS_PER_SEG"; [ -z "$IPS_PER_SEG" ] && IPS_PER_SEG=5
+LOCAL_IPS_PER_SEG="$V4_LOCAL_IPS_PER_SEG"; [ -z "$LOCAL_IPS_PER_SEG" ] && LOCAL_IPS_PER_SEG=20
 LAT_TIMEOUT="$V4_LAT_TIMEOUT"; [ -z "$LAT_TIMEOUT" ] && LAT_TIMEOUT=1
 LAT_THREAD="$V4_LAT_THREAD"; [ -z "$LAT_THREAD" ] && LAT_THREAD=32
 DIV_SEG_MAX="$V4_DIV_SEG_MAX"; [ -z "$DIV_SEG_MAX" ] && DIV_SEG_MAX=2
@@ -372,7 +373,8 @@ fi
 #       IPS_PER_SEG 个段内随机 IP（urandom 真随机种子、段内去重、避开 .0/.255），
 #       让每条段贡献多个候选；粗于 /24 的段（正常已被归一化展开，此处兜底）在全段范围随机
 EXPCNT=0
-cat "$V4DIR/.seg.keep" "$V4DIR/.seg.pick" "$V4DIR/.seg.local.norm" 2>/dev/null \
+# 订阅段展开：学习段 + 随机段，每条 IPS_PER_SEG 个段内随机 IP
+cat "$V4DIR/.seg.keep" "$V4DIR/.seg.pick" 2>/dev/null \
     | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]+$' | sort -u > "$V4DIR/.seg.exp.in"
 if [ "$IPS_PER_SEG" -gt 0 ] && [ -s "$V4DIR/.seg.exp.in" ]; then
     RSEED2=$(head -c 8 /dev/urandom 2>/dev/null | md5sum 2>/dev/null | cut -c1-8)
@@ -403,6 +405,40 @@ if [ "$IPS_PER_SEG" -gt 0 ] && [ -s "$V4DIR/.seg.exp.in" ]; then
     }' "$V4DIR/.seg.exp.in" 2>/dev/null > "$V4DIR/.seg.exp"
     EXPCNT=$(grep -c . "$V4DIR/.seg.exp" 2>/dev/null); [ -z "$EXPCNT" ] && EXPCNT=0
 fi
+# 本地优选段展开：手写 CIDR 段（.seg.local.norm），每条 LOCAL_IPS_PER_SEG 个段内随机 IP。
+# 手写段 = 人工优选段，无需大量撒网；/24 单段天然封顶 254，但多条叠加仍靠此值控制总量
+LEXPCNT=0
+cat "$V4DIR/.seg.local.norm" 2>/dev/null \
+    | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]+$' | sort -u > "$V4DIR/.seg.exp.in.local"
+if [ "$LOCAL_IPS_PER_SEG" -gt 0 ] && [ -s "$V4DIR/.seg.exp.in.local" ]; then
+    RSEEDL=$(head -c 8 /dev/urandom 2>/dev/null | md5sum 2>/dev/null | cut -c1-8)
+    [ -z "$RSEEDL" ] && RSEEDL="4d3c2b1a"
+    awk -v n="$LOCAL_IPS_PER_SEG" -v hx="$RSEEDL" '
+    function h2d(s,  i,c,r){r=0;for(i=1;i<=length(s);i++){c=index("0123456789abcdef",tolower(substr(s,i,1)))-1;r=r*16+c}return r}
+    function emit(key) { printf "%d.%d.%d.%d\n", int(key/16777216)%256, int(key/65536)%256, int(key/256)%256, key%256 }
+    BEGIN{srand(h2d(hx))}
+    {
+        split($0, a, "/")
+        plen = a[2] + 0
+        if (plen >= 32) { print a[1]; next }   # /32 原样保留
+        split(a[1], o, ".")
+        size = 2 ^ (32 - plen)
+        base = o[1]*16777216 + o[2]*65536 + o[3]*256 + o[4]
+        base = int(base / size) * size          # 对齐网络地址（容错未对齐写法）
+        if (plen == 24) { lo = 1; hi = 254 }    # /24 避开网络地址 .0 与广播 .255
+        else if (plen > 24) { lo = 0; hi = size - 1 }
+        else { lo = 0; hi = size - 1 }          # 粗段兜底：全段随机
+        cnt = 0; seen = 0
+        while (cnt < n && seen < n * 10) {
+            seen++
+            key = base + int(rand() * (hi - lo + 1)) + lo
+            if ((NR "." key) in got) continue
+            got[NR "." key] = 1; cnt++
+            emit(key)
+        }
+    }' "$V4DIR/.seg.exp.in.local" 2>/dev/null > "$V4DIR/.seg.exp.local"
+    LEXPCNT=$(grep -c . "$V4DIR/.seg.exp.local" 2>/dev/null); [ -z "$LEXPCNT" ] && LEXPCNT=0
+fi
 # 1e. 外部 IP 抽样：IP 通道候选去重后随机抽 IP_PICK 条直接入池（cfst 按 /32 原样测）
 IPCNT=0
 if [ "$IP_PICK" -gt 0 ] && [ -s "$V4DIR/.ips.all" ]; then
@@ -416,13 +452,13 @@ if [ "$IP_PICK" -gt 0 ] && [ -s "$V4DIR/.ips.all" ]; then
     IPCNT=$(grep -c . "$V4DIR/.ips.pick" 2>/dev/null); [ -z "$IPCNT" ] && IPCNT=0
     rm -f "$V4DIR/.ips.u"
 fi
-cat "$V4DIR/.seg.exp" "$V4DIR/.learn.ips" "$V4DIR/.p3" "$V4DIR/.ips.pick" 2>/dev/null \
+cat "$V4DIR/.seg.exp" "$V4DIR/.seg.exp.local" "$V4DIR/.learn.ips" "$V4DIR/.p3" "$V4DIR/.ips.pick" 2>/dev/null \
     | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' \
     | sort -u > "$V4DIR/pool.txt"
 PCNT=$(grep -c . "$V4DIR/pool.txt" 2>/dev/null)
 [ -z "$PCNT" ] && PCNT=0
-echo "[$(date '+%m-%d %H:%M:%S')]池构建：细分段源 $SEGCNT 段（学习段 $LEARNED + 随机段 $PICKED = $SEGTOTAL）+ 本地优选段 $LOCALCNT 段 → 展开 $EXPCNT 个段内随机 IP + 学习复测 $LIPCNT 个 + 自建池 $SCNT 条 + 外部IP $IPCNT 条 → pool.txt 共 $PCNT 行" >> "$LOG"
-rm -f "$V4DIR/.seg.all" "$V4DIR/.seg.local" "$V4DIR/.seg.local.norm" "$V4DIR/.seg.learn" "$V4DIR/.seg.keep" "$V4DIR/.seg.rest" "$V4DIR/.seg.rest0" "$V4DIR/.seg.pick" "$V4DIR/.seg.exp.in" "$V4DIR/.seg.exp" "$V4DIR/.learn.ips" "$V4DIR/.p3" "$V4DIR/.ips.all" "$V4DIR/.ips.pick"
+echo "[$(date '+%m-%d %H:%M:%S')]池构建：细分段源 $SEGCNT 段（学习段 $LEARNED + 随机段 $PICKED = $SEGTOTAL）+ 本地优选段 $LOCALCNT 段 → 展开 $EXPCNT 个段内随机 IP + 本地段展开 $LEXPCNT 个 + 学习复测 $LIPCNT 个 + 自建池 $SCNT 条 + 外部IP $IPCNT 条 → pool.txt 共 $PCNT 行" >> "$LOG"
+rm -f "$V4DIR/.seg.all" "$V4DIR/.seg.local" "$V4DIR/.seg.local.norm" "$V4DIR/.seg.learn" "$V4DIR/.seg.keep" "$V4DIR/.seg.rest" "$V4DIR/.seg.rest0" "$V4DIR/.seg.pick" "$V4DIR/.seg.exp.in" "$V4DIR/.seg.exp" "$V4DIR/.seg.exp.in.local" "$V4DIR/.seg.exp.local" "$V4DIR/.learn.ips" "$V4DIR/.p3" "$V4DIR/.ips.all" "$V4DIR/.ips.pick"
 
 if [ "$PCNT" -eq 0 ]; then
     echo "[$(date '+%m-%d %H:%M:%S')]池为空（细分段源失效且无历史），本轮退出，$RESULT_FILE 保留上次值" >> "$LOG"
