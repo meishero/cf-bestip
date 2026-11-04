@@ -4,8 +4,9 @@
 #
 # 【池子构成】自建学习池 + baipiao.eu.org 细分 /48 段（每轮 20 条，每条展开 200 个段内随机 IP）
 #   段源（V6url.txt）支持订阅 URL 与本地直写 CIDR 段/纯 IP 混写（每行一个，# 为注释）
-#   - 前缀级自学习：历史 best 的 IP 按 /48 前缀计数，反复产出好 IP 的优质段强制入池（利用），
-#     其余名额随机抽（探索）；最近一轮上榜 IP 直接复测（连续性保障，驱动 /64 定向生成）
+#   - 前缀级自学习（滑动窗口）：最近 LEARN_WINDOW 份历史 best 的 IP 按 /48 前缀计数，
+#     反复产出好 IP 的优质段强制入池（利用），过时段自动滑出紧跟 CF 变化；其余名额随机抽（探索），
+#     且避开最近已探索段扩大覆盖；最近一轮上榜 IP 直接复测（连续性保障，驱动 /64 定向生成）
 #   - 段展开：入池段由脚本生成 V6_IPS_PER_SEG 个段内随机 IPv6（候选量精确可控、
 #     全段均匀采样），cfst 收到的池全部为裸 IP（/128 逐条原样测），不再用 cfst 随机游走
 #   - HTTPing 目标 = cp.cloudflare.com/generate_204（captive portal 检测域，无 bot 防护基本不限流；www.cloudflare.com 有 WAF 会拦 Go 客户端，勿用）
@@ -15,8 +16,8 @@
 #
 # 【流程】
 # 1. 构建池 pool.txt = 自建池（最近一轮 best 的上榜 IP，延迟<SELF_LAT，直接复测保连续性）
-#    + 学习段（历史 best 的 /48 前缀产出好 IP >=SELF_MIN 次的优质段，需在细分段池中存在，最多 LEARN_MAX）
-#    + 随机段（从合并段池随机抽补足 20 条）
+#    + 学习段（最近 LEARN_WINDOW 份历史 best 的 /48 前缀产出好 IP >=SELF_MIN 次的优质段，最多 LEARN_MAX）
+#    + 随机段（从合并段池随机抽补足，避开最近已探索段扩大覆盖）
 #    → 学习段+随机段每条展开 V6_IPS_PER_SEG 个段内随机 IPv6（纯字符串随机，量可控）
 #    最终 pool.txt = 展开的随机 IP + 自建池单 IP + 外部抽的纯 IP（全部裸 IP）
 # 2. HTTPing 延迟测速（-tl 250）：失败则探 trace 端点，429 每 120 秒
@@ -63,6 +64,8 @@ fi
 KEEP="$V6_KEEP"; TOPN="$V6_TOPN"; DL_TOPN="$V6_DL_TOPN"; FAST_TOPN="$V6_FAST_TOPN"
 RESULT_FILE="$V6_RESULT_FILE"; [ -z "$RESULT_FILE" ] && RESULT_FILE="best_ip_v6.txt"
 SEG_PICK="$V6_SEG_PICK"; LEARN_MAX="$V6_LEARN_MAX"; SELF_MIN="$V6_SELF_MIN"; SELF_LAT="$V6_SELF_LAT"
+LEARN_WINDOW="$V6_LEARN_WINDOW"; [ -z "$LEARN_WINDOW" ] && LEARN_WINDOW=24
+AVOID_KEEP="$V6_AVOID_KEEP"; [ -z "$AVOID_KEEP" ] && AVOID_KEEP=48
 MAX_SCAN_ROUNDS="$V6_MAX_SCAN_ROUNDS"; LAT_URL="$V6_LAT_URL"; FAST_URL="$V6_FAST_URL"
 DL_URL="$V6_DL_URL"; DL_MAXTIME="$V6_DL_MAXTIME"; DL_RETRY="$V6_DL_RETRY"; IP_PICK="$V6_IP_PICK"
 DL_RUNS="$V6_DL_RUNS"; [ -z "$DL_RUNS" ] && DL_RUNS=2
@@ -253,12 +256,15 @@ awk -F'[][#-]' -v slat="$SELF_LAT" \
     '{ ip=$2; lat=$6; sub(/ms$/, "", lat); if (ip ~ /^[0-9a-f]*:/ && lat+0>0 && lat+0<slat) print ip }' \
     "$LASTHIST" > "$V6DIR/.p3" 2>/dev/null
 [ -s "$V6DIR/.p3" ] && SCNT=$(grep -c . "$V6DIR/.p3")
-# 1b-1. 前缀级段学习：所有历史 best 的 IP 按 /48 前缀（前3组）计数。
+# 1b-1. 前缀级段学习（滑动窗口）：只统计最近 LEARN_WINDOW 份历史（ls -t 时间倒序），
+#       过时段自动滑出学习池、紧跟 CF 优选变化（不被历史累计次数软固化）。
 #       按"轮次去重"——同一 /48 在同一轮最多计 1 次（避免单轮刷满 10 条污染学习）；
 #       累计上榜轮次 >=SELF_MIN 的 /48 视为优质段 → 供 1c 强制入池。
 #       按上榜轮次降序取 LEARN_MAX（确定性排序，取代哈希序 head）
+#       WIN_FILES 供 1b-1 / 1b-2 共用（学习段统计与精确 IP 复测都只看窗口内历史）
 : > "$V6DIR/.seg.learn.raw"
-ls "$V6DIR"/history/best_*.txt >/dev/null 2>&1 && \
+WIN_FILES=$(ls -t "$V6DIR"/history/best_*.txt 2>/dev/null | head -n "$LEARN_WINDOW")
+[ -n "$WIN_FILES" ] && \
 awk -F'[][#-]' -v smin="$SELF_MIN" -v slat="$SELF_LAT" '
 function k48(ip,   p,nl,nr,L,R) {
     p = index(ip, "::")
@@ -273,7 +279,7 @@ FNR==1 { fid++ }
       if (seen[k] != fid) { seen[k] = fid; cnt[k]++ }
   } }
 END { for (k in cnt) if (cnt[k] >= smin) print cnt[k] " " k }' \
-    "$V6DIR"/history/best_*.txt > "$V6DIR/.seg.learn.raw" 2>/dev/null
+    $WIN_FILES > "$V6DIR/.seg.learn.raw" 2>/dev/null
 sort -rn "$V6DIR/.seg.learn.raw" 2>/dev/null | head -n "$LEARN_MAX" | awk '{print $2}' > "$V6DIR/.seg.learn"
 rm -f "$V6DIR/.seg.learn.raw"
 # 1b-1s. 短期记忆（冷启动加速）：上轮 best 上榜 IP 的 /48 前缀直接并入学习段，
@@ -297,7 +303,7 @@ fi
 #      （已证明的地址比重新随机更稳，是"利用"的核心）；每个学习段最多 TGT_PER_IP 个
 : > "$V6DIR/.learn.ips"
 if [ -s "$V6DIR/.seg.learn" ]; then
-    ls "$V6DIR"/history/best_*.txt >/dev/null 2>&1 && \
+    [ -n "$WIN_FILES" ] && \
     awk -F'[][#-]' -v slat="$SELF_LAT" -v maxper="$TGT_PER_IP" '
     function k48(ip,   p,nl,nr,L,R) {
         p = index(ip, "::")
@@ -311,7 +317,7 @@ if [ -s "$V6DIR/.seg.learn" ]; then
           k = k48(ip)
           if ((k in lk) && !(ip in seen) && gotc[k] < maxper) { gotc[k]++; seen[ip]=1; print ip }
       } }
-    ' "$V6DIR/.seg.learn" "$V6DIR"/history/best_*.txt > "$V6DIR/.learn.ips" 2>/dev/null
+    ' "$V6DIR/.seg.learn" $WIN_FILES > "$V6DIR/.learn.ips" 2>/dev/null
 fi
 LIPCNT=$(grep -c . "$V6DIR/.learn.ips" 2>/dev/null); [ -z "$LIPCNT" ] && LIPCNT=0
 [ "$LIPCNT" -gt 0 ] && echo "[$(date '+%m-%d %H:%M:%S')]  学习复测：$LIPCNT 个历史精确好 IP 直接入池" >> "$LOG"
@@ -388,15 +394,24 @@ if [ "$SEGCNT" -gt 0 ] && [ -s "$V6DIR/.seg.learn" ]; then
         fi
     fi
 fi
-# 1d. 随机抽段补足名额（排除已学习段）
+# 1d. 随机抽段补足名额（排除已学习段 + 最近已探索段，扩大探索覆盖）
 if [ "$SEGCNT" -gt 0 ]; then
     REMAIN=$((SEG_PICK - LEARNED))
     [ "$REMAIN" -lt 0 ] && REMAIN=0
     if [ "$REMAIN" -gt 0 ]; then
+        # 先排除已学习段 → .seg.rest0
         if [ -s "$V6DIR/.seg.keep" ]; then
-            grep -Fvxf "$V6DIR/.seg.keep" "$V6DIR/.seg.all" 2>/dev/null > "$V6DIR/.seg.rest"
+            grep -Fvxf "$V6DIR/.seg.keep" "$V6DIR/.seg.all" 2>/dev/null > "$V6DIR/.seg.rest0"
         else
-            cp "$V6DIR/.seg.all" "$V6DIR/.seg.rest" 2>/dev/null
+            cp "$V6DIR/.seg.all" "$V6DIR/.seg.rest0" 2>/dev/null
+        fi
+        # 再排除最近 AVOID_KEEP 条已探索段（探索去重）；若排除后剩余不足 REMAIN，
+        # 回退到仅排除学习段（允许重抽保量，避免段源不足导致抽样卡死）
+        cp "$V6DIR/.seg.rest0" "$V6DIR/.seg.rest" 2>/dev/null
+        if [ "$AVOID_KEEP" -gt 0 ] && [ -s "$V6DIR/.seg.avoid" ]; then
+            grep -Fvxf "$V6DIR/.seg.avoid" "$V6DIR/.seg.rest0" 2>/dev/null > "$V6DIR/.seg.rest"
+            RESTCNT=$(grep -c . "$V6DIR/.seg.rest" 2>/dev/null); [ -z "$RESTCNT" ] && RESTCNT=0
+            [ "$RESTCNT" -lt "$REMAIN" ] && cp "$V6DIR/.seg.rest0" "$V6DIR/.seg.rest" 2>/dev/null
         fi
         # 随机抽样：urandom → md5 前8位 hex → h2d 转十进制做种子（busybox 的 srand
         # 对超 32 位整数不可靠、od 输出损坏，此组合已在路由器实测三次抽样互不相同）
@@ -410,6 +425,12 @@ if [ "$SEGCNT" -gt 0 ]; then
     fi
 fi
 SEGTOTAL=$((LEARNED + PICKED))
+# 1d-3. 探索去重记录：本轮抽中的随机段追加进 .seg.avoid，保留最近 AVOID_KEEP 条
+#       （滑动窗口，段被抽中后约停留 AVOID_KEEP/每轮随机段量 轮后重新可抽，扩大探索面）
+if [ "$AVOID_KEEP" -gt 0 ] && [ -s "$V6DIR/.seg.pick" ]; then
+    { cat "$V6DIR/.seg.avoid" "$V6DIR/.seg.pick" 2>/dev/null; } | tail -n "$AVOID_KEEP" > "$V6DIR/.seg.avoid.tmp"
+    mv "$V6DIR/.seg.avoid.tmp" "$V6DIR/.seg.avoid"
+fi
 # 1d-2. 段展开：学习段+随机段每条生成 IPS_PER_SEG 个段内随机 IPv6
 #     IPv6 是 128 位，awk 浮点精度不够不能转数字算术，改用纯字符串运算：
 #     地址展开为 32 个 hex 字符 → 保留前 plen/4 个 → 其余逐位随机取 hex；
@@ -497,7 +518,7 @@ fi
 PCNT=$(grep -c . "$V6DIR/pool.txt" 2>/dev/null)
 [ -z "$PCNT" ] && PCNT=0
 echo "[$(date '+%m-%d %H:%M:%S')]池构建：细分段源 $SEGCNT 段（学习段 $LEARNED + 随机段 $PICKED = $SEGTOTAL）→ 展开 $EXPCNT 个段内随机 IP + 学习复测 $LIPCNT 个 + 定向 $TGCNT 个 + 自建池 $SCNT 条 + 外部IP $IPCNT 条 → pool.txt 共 $PCNT 行" >> "$LOG"
-rm -f "$V6DIR/.seg.all" "$V6DIR/.seg.learn" "$V6DIR/.seg.keep" "$V6DIR/.seg.rest" "$V6DIR/.seg.pick" "$V6DIR/.seg.exp" "$V6DIR/.learn.ips" "$V6DIR/.p3" "$V6DIR/.p3.tgt" "$V6DIR/.seg.keyed" "$V6DIR/.ips.all" "$V6DIR/.ips.pick"
+rm -f "$V6DIR/.seg.all" "$V6DIR/.seg.learn" "$V6DIR/.seg.keep" "$V6DIR/.seg.rest" "$V6DIR/.seg.rest0" "$V6DIR/.seg.pick" "$V6DIR/.seg.exp" "$V6DIR/.learn.ips" "$V6DIR/.p3" "$V6DIR/.p3.tgt" "$V6DIR/.seg.keyed" "$V6DIR/.ips.all" "$V6DIR/.ips.pick"
 
 if [ "$PCNT" -eq 0 ]; then
     echo "[$(date '+%m-%d %H:%M:%S')]池为空（细分段源失效且无历史），本轮退出，$RESULT_FILE 保留上次值" >> "$LOG"
