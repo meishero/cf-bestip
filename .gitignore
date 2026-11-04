@@ -1,0 +1,4 @@
+# 结果文件：由 githubpush.sh 通过 GitHub Contents API 上传更新，git 不跟踪
+# （避免 git push 覆盖/删除这些运行产物，源码与结果分离）
+best_ip_*.txt
+status_*.txt
