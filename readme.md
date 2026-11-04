@@ -1,18 +1,36 @@
 # CloudflareSpeedTest 优选系统 · 完整流程与逻辑说明
 
-> 适用版本：2026-11-04（含前缀级学习滑动窗口 / 随机段探索去重 / 段源缓存兜底+失败重试 / 本地优选段确定性进池+独立展开数 / 短期记忆 / 三级多样性筛选 / 快筛按机场分组采样 / 机场分布观测 / 全参数配置化 / 48 线程 / 1MB 快筛 / status.txt）
-> 部署位置：路由器 `/data/cfst/`（OpenWrt / busybox 1.25.1）
-> 文件清单：`run.sh`（总调度）· `run_v6.sh` · `run_v4.sh` · `githubpush.sh` · `config.txt` · `V6url.txt` · `V4url.txt` · `cfst`（XIU2 二进制）
+> 适用版本：2026-11-04 **v2**
+> 相对上一版的改动：两段式延迟测速 / 稳态速度口径 / 快筛改淘汰赛（不参与定序）/ 精测双样本 / GitHub 5xx 重试 / OOM 防护 / 日志按字节修剪
+> 部署位置：路由器 `/data/cfst/`（OpenWrt 18.06-SNAPSHOT / aarch64 / busybox 1.25.1 / 402MB 内存）
+> 文件清单：`run.sh`（总调度）· `run_v6.sh` · `run_v4.sh` · `githubpush.sh` · `config.txt` · `V6url.txt` · `V4url.txt` · `cfst`（XIU2 v2.3.5 二进制）
 
 ---
 
 ## 0. 系统总览
 
+### 0.1 仓库布局
+
 ```
-cron（17 0,6-23 * * *，系统 crontab 写死，不在 config.txt）
+cf-bestip/
+├── best_ip_v6_yidong.txt / best_ip_v4_yidong.txt / status_yidong.txt    ← 移动路由自动上传（Contents API）
+├── best_ip_v6_dianxin.txt / best_ip_v4_dianxin.txt / status_dianxin.txt ← 电信路由自动上传
+├── src/        当前版本脚本与配置（脱敏模板：GH_REPO / GH_TOKEN / STATUS_FILE / *_RESULT_FILE 已置空）
+├── cfstyd/     移动路由 /data/cfst 整目录快照（含 history/ 与日志，人工留档）
+└── cfstdx/     电信路由 /data/cfst 整目录快照
+```
+
+- 根目录的 `best_ip_*` / `status_*` 由路由器通过 GitHub Contents API 直接写入，`.gitignore` 已排除，**本地 git 不跟踪**（避免 `git push` 覆盖运行产物）。
+- 同一套脚本部署到不同运营商的路由器时，只改 `V6/V4_RESULT_FILE` 与 `STATUS_FILE` 的前缀（`yidong` / `dianxin`），各机互不覆盖。
+- 另一个运营商路由器的 `status_*.txt` 最后更新时间超过 2 小时 = 那台机器掉线或 cron 没跑。
+
+### 0.2 调度链
+
+```
+cron（10 轮/天，01:00-06:00 不跑，其余每 2 小时一轮，错开整点 :17；系统 crontab 写死，不在 config.txt）
    └→ run.sh 总调度
         ├→ 校验 config.txt（sh -n，坏则退出）
-        ├→ 主锁（防叠跑）
+        ├→ 主锁（PID + /proc/PID/cmdline 校验，防叠跑；死锁自动接管）
         ├→ timeout -t V6_TIMEUP sh run_v6.sh   → RC_V6
         ├→ timeout -t V4_TIMEUP sh run_v4.sh   → RC_V4
         └→ sh githubpush.sh $RC_V6 $RC_V4
@@ -22,12 +40,15 @@ cron（17 0,6-23 * * *，系统 crontab 写死，不在 config.txt）
              └→ 上传 $STATUS_FILE（每轮覆盖，健康状态一览）
 ```
 
-三个顶级开关（config.txt 最上面）：`GH_UPLOAD_ENABLE` / `V6_ENABLE` / `V4_ENABLE`。
-组合示例：只测 v4 不上传 = `GH_UPLOAD_ENABLE=0 + V6_ENABLE=0 + V4_ENABLE=1`。
+- 三个顶级开关（config.txt 最上面）：`GH_UPLOAD_ENABLE` / `V6_ENABLE` / `V4_ENABLE`。
+- 组合示例：只测 v4 不上传 = `GH_UPLOAD_ENABLE=0 + V6_ENABLE=0 + V4_ENABLE=1`。
+- **单轮实测**：v6 子脚本 431s，含上传 438s（第 7 节的流量/耗时对比是同一天的实测值）；旧版（单段延迟 + 单样本精测）268~340s。
+- **单轮流量**：v6 约 **300MB** = 快筛 24×1MB + 精测 16×2×9.1MB（理论 317MB）；按 10 轮/天约 **3.0GB**。
+  v4 脚本同构、同一批数值，所以**双栈全开 = 约 600MB/轮、6.1GB/天**（v4 当前 `V4_ENABLE=0`）。
 
 ---
 
-## 1. run_v6.sh 逐步逻辑（v4 同构，差异单独标注）
+## 1. run_v6.sh 逐步逻辑（v4 同构，差异见第 2 节）
 
 ### 0. 配置加载与锁
 - `sh -n config.txt` 语法校验，**失败 → 记日志退出(1)**。
@@ -37,7 +58,7 @@ cron（17 0,6-23 * * *，系统 crontab 写死，不在 config.txt）
 
 ### 0.5 下载源预检
 - HEAD 探测 `FAST_URL` 和 `DL_URL`，**任一非 200 → 整体回退**官方 `speed.cloudflare.com/__down`（5MB/10MB，写死）。
-- 配置项：`V6_FAST_URL`、`V6_DL_URL`；写死：回退 URL、探测超时 6s/12s。
+- 配置项：`V6_FAST_URL`、`V6_DL_URL`；写死：回退 URL、探测超时 12s。
 
 ### 1a. 段源拉取与逐行分流（V6url.txt）
 每行按顺序判定，**命中即停**：
@@ -58,19 +79,20 @@ cron（17 0,6-23 * * *，系统 crontab 写死，不在 config.txt）
 
 ### 1a-2b. 本地优选段归一化 + 确定性进池
 - 手写 CIDR 段（`.seg.local`）按与订阅段**相同的归一化规则**处理（v6 /48 基准、v4 /24 基准）。
-- 归一化后每条段展开 `LOCAL_IPS_PER_SEG` 个段内随机 IP（独立配置，默认 20，比订阅段的 `IPS_PER_SEG` 小——优选段无需大量撒网；段数多时靠它控制总量），**确定性全进 pool.txt**（不参与随机抽段，也不受 `IP_PICK` 外部 IP 抽样约束）。
+- 归一化后每条段展开 `LOCAL_IPS_PER_SEG` 个段内随机 IP（当前 254），**确定性全进 pool.txt**（不参与随机抽段，也不受 `IP_PICK` 外部 IP 抽样约束）。
 - 语义：手写段 = 人工优选段，应每轮必测；订阅段 = 未优选全量，随机探索。
 
 ### 1b. 自建池（上轮赢家直接复测）
 - 取**最近一轮** `history/best_*.txt` 的上榜 IP（延迟 < `SELF_LAT`）→ 入自建池 `.p3`（裸 IP，直接进池）。
 - 随机生成下 IP 不会跨轮重复，旧的"精确 IP 计数 ≥SELF_MIN"永远为 0，已废弃；改为"上轮赢家直接回测"保连续性。
-- 配置项：`V6_SELF_LAT=250`（SELF_MIN 已转用于 1b-1 学习段阈值）。
+- 配置项：`V6_SELF_LAT=200`（SELF_MIN 已转用于 1b-1 学习段阈值）。
 
 ### 1b-1. 前缀级段学习（滑动窗口）
 - 遍历**最近 `LEARN_WINDOW` 份** `history/best_*.txt`（`ls -t` 时间倒序取前 N），每个 IP 归到 /48（v6）/ /24（v4）前缀并计数；
   累计上榜**轮次**（同一段一轮最多计 1 次，防单轮刷满污染）≥ `SELF_MIN` 的段 → 优质段，按轮次降序取 `LEARN_MAX`。
-- 滑动窗口的意义：只认最近约 1 天（24 份）的好段，过时段自动滑出学习池、紧跟 CF 优选变化——避免历史累计次数把已过时段"软固化"在池里；`LEARN_WINDOW=0` 退回统计全部历史（旧行为）。
+- 滑动窗口的意义：只认最近约 1 天（24 份）的好段，过时段自动滑出学习池、紧跟 CF 优选变化；`LEARN_WINDOW=0` 退回统计全部历史。
 - 段可跨轮重复命中，是唯一稳定的学习单位；v6 用前 3 组 key 包含匹配（兼容 /52 /56 /64），v4 用 `x.y.z.0/24` 全字匹配。
+- 实测有效：22 轮里 `2606:4700:8ca8` 出现 36 次、`83b5` 29 次、`83b1` 23 次——优质段稳定复现，而精确 IP 跨轮重复率≈0（/48 内随机空间太大）。
 - 配置项：`V6_SELF_MIN=2`、`V6_LEARN_MAX=8`、`V6_LEARN_WINDOW=24`。
 
 ### 1b-1s. 短期记忆（冷启动加速）
@@ -78,11 +100,11 @@ cron（17 0,6-23 * * *，系统 crontab 写死，不在 config.txt）
 - 短期记忆排前（优先），长期学习段补足到 `LEARN_MAX`。
 
 ### 1b-2. 学习定向（v6 独有，v4 无）
-- 自建池每个好 IP → 展开 32 位 hex → 取前 16 位 = **/64 前缀**，去重后最多 16 个。
+- 自建池每个好 IP → 展开 32 位 hex → 取前 16 位 = **/64 前缀**，去重后最多 `TGT_MAX_PREFIX` 个。
 - 每个前缀生成 `TGT_PER_IP` 个随机 IP（后 4 组随机），入池 `.p3.tgt`。
 - 原理：/48 学习段展开是全段随机，好 IP 的优质邻域在特定 /64 里，定点生成命中率远高于全段随机。
 - 分支：`TGT_PER_IP=0` 或自建池空 → 跳过。
-- 配置项：`V6_TGT_PER_IP=25`；写死：/64 粒度、16 个上限。
+- 配置项：`V6_TGT_PER_IP=25`、`V6_TGT_MAX_PREFIX=16`；写死：/64 粒度。
 - v4 为什么没有：/24 全段只有 254 个地址，`IPS_PER_SEG=200` 已近穷举，定向无意义。
 
 ### 1c. 段级学习
@@ -94,7 +116,8 @@ cron（17 0,6-23 * * *，系统 crontab 写死，不在 config.txt）
 ### 1d. 随机抽段（含探索去重）
 - 名额 = `SEG_PICK - LEARNED`；**≤0 → 跳过本轮抽段**。
 - 排除已学习段后，再**排除最近 `AVOID_KEEP` 条已探索段**（`.seg.avoid` 滑动窗口记录），随机抽样（urandom→md5 前 8 位 hex→h2d 做 srand 种子；busybox srand 大数截断坑的规避方案）。
-- 探索去重：每轮抽中的随机段追加进 `.seg.avoid` 并 `tail -n $AVOID_KEEP` 裁剪，避免连续几轮重复探索同一批段、扩大覆盖；若排除后剩余不足名额则**回退到仅排除学习段**（允许重抽保量）；`AVOID_KEEP=0` 关闭去重。
+- 若排除后剩余不足名额则**回退到仅排除学习段**（允许重抽保量）；`AVOID_KEEP=0` 关闭去重。
+- 现状观察：段源 633 条里真正能产出赢家的只有 6~8 条，随机段命中率低但承担"发现新优质段"的职责；每轮 20 段中学习段 8 + 随机段 12。
 - 配置项：`V6_SEG_PICK=20`、`V6_AVOID_KEEP=48`；写死：`head -c 8 /dev/urandom`、种子兜底值 `1a2b3c4d`。
 
 ### 1d-2. 段展开（脚本自生成随机 IP，替代 cfst 随机游走）
@@ -109,48 +132,73 @@ cron（17 0,6-23 * * *，系统 crontab 写死，不在 config.txt）
 - 配置项：`V6_IP_PICK=100`。
 
 ### 池组装
-- 展开生效：`pool.txt = 段展开 IP + 定向 IP + 自建池 + 外部 IP`（全裸 IP，cfst 逐条原样测）。
+- 展开生效：`pool.txt = 段展开 IP + 本地段展开 IP + 定向 IP + 学习复测 IP + 自建池 + 外部 IP`（全裸 IP，cfst 逐条原样测）。
 - 展开关闭/失败：回退 `学习段 + 随机段(CIDR) + 自建池 + 外部 IP`。
-- **池为空 → 记日志退出(1)**（保留上次结果文件）。
+- 实测池大小 4460~4526 行；**池为空 → 记日志退出(1)**（保留上次结果文件）。
 
-### 2. HTTPing 延迟测速（循环）
-- cfst 命令：`-httping -n $LAT_THREAD -t $LAT_TIMEOUT -dd -p 10 -url $LAT_URL -httping-code 204 -tl $SELF_LAT`
+### 2. HTTPing 延迟测速（两段式 + 循环重试）
+
+**v2 改动：原来 `-t 1` 只探一次，"平均延迟"就是单样本**——实测同一 IP 单次 68ms、4 次平均后 110ms，机场内 116/117/118ms 的排序全是噪声，而 `-tl 250` 的通过率高达 54%~88%，等于没筛。改两段式：
+
+| 段 | 命令要点 | 作用 |
+|---|---|---|
+| 第一段（粗扫） | `-t $LAT_TIMEOUT(1)`，`-tl $((SELF_LAT+60))` → `.lat1.csv` | 用放宽 60ms 的门槛剔死/高延迟 IP，容忍单次探测抖动、零误杀 |
+| 第二段（精测延迟） | 取 `.lat1.csv` 第 1 列为 `.lat1.ips`，`-t $LAT_TRYS(4)`，`-tl $SELF_LAT`，`-tlr $LAT_LOSS(0.2)` → `.lat.csv` | 4 次取平均 + 丢包门槛，只有幸存者参与（代价约为"全量 4 次"的 1/3） |
+
+- 完整参数：`cfst -f pool.txt -httping -n $LAT_THREAD -t N -dd -p 0 -url $LAT_URL -httping-code 204 -tl ... [-tlr ...] -o ...`
+- **`-p 0` 说明**：cfst 的 `-p` 是"控制台显示结果条数"，不是端口探测间隔（旧注释写错了）。0 = 不打印表格，`-o` 指定的 CSV 照常写入（已实测）。
 - 循环分支：
+
   | 情况 | 动作 |
   |---|---|
   | 成功且有候选 | break 进入快筛 |
   | 失败且轮数 ≥ `MAX_SCAN_ROUNDS` | **放弃本轮 exit 1** |
   | 失败，端点 429 | `wait_429_clear` 退避等待后重扫 |
   | 失败，端点无 429，累计 ≥3 轮 | **判致命问题 exit 1** |
+- **OOM 防护**：cfst 是 Go 二进制，402MB 内存下启动时可能 `out of memory allocating heap arena map` 直接带栈退出；检测到该特征 → 并发降到 `OOM_THREAD` 重试 1 次，连续 2 次放弃本轮（不再空转 MAX_SCAN_ROUNDS 轮）。每轮扫描前仍先 `drop_caches`。
 - 退避策略（`wait_429_clear`）：间隔 120→240→480→600(封顶) 秒（`BACKOFF_ENABLE=1`，否则固定 120）；**累计等待 ≥ `429_WAIT_MAX` → 放弃本轮**。
-- 配置项：`V6_LAT_THREAD=32`、`V6_LAT_TIMEOUT=1`、`V6_LAT_URL`、`V6_SELF_LAT=250`（-tl 门槛）、`V6_MAX_SCAN_ROUNDS=30`、`V6_BACKOFF_ENABLE=1`、`V6_429_WAIT_MAX=1200`；写死：`-httping-code 204`、`-dd`（禁下载测速）、`-p 10`。
+- 实测：池 4500 → 粗扫幸存 2765~3018 → 二次延迟后 **1874~1880 个候选（<200ms）**，延迟阶段 190s。
+- 配置项：`LAT_THREAD=48`、`LAT_TIMEOUT=1`、`LAT_TRYS=4`、`LAT_LOSS=0.2`、`LAT_URL`、`SELF_LAT=200`、`OOM_THREAD=24`、`MAX_SCAN_ROUNDS=30`、`429_WAIT_MAX=600`、`TIMEUP=1200`。
 
-### 3. 下载闸门 + 4a 快筛
+### 3. 下载闸门 + 4a 快筛（只做淘汰门槛）
+
 - 闸门：HEAD 探测 `DL_URL`，429 则 `wait_429_clear`，超限 → **放弃本轮**。
-- 快筛候选抽取（按机场分组采样）：从**全部**延迟候选里，每个机场（colo）取延迟最低的 `COLO_PICK` 个，
-  强制每个机场都有代表进快筛（防单一机场延迟优势霸榜，实测曾出现 30 个快筛候选 100% 同机场）；
-  不足 `DL_TOPN` 时按延迟顺位回填；`COLO_PICK=0` 退化为纯延迟顺位（"延迟最优优先"，牺牲机场多样性）。
-- 快筛：入选候选逐个（串行）下载 `FAST_URL` 1 次，curl `--resolve` 强制 IP，`--max-time $DL_MAXTIME`。
-- 每个 IP 撞 429：等 120/240/480 秒重试，超过 `DL_RETRY=3` 次 → **该样本记 0 分跳过**。
-- 配置项：`V6_DL_TOPN=30`、`V6_COLO_PICK=3`、`V6_FAST_URL`、`V6_DL_MAXTIME=10`、`V6_DL_RETRY=3`、`V6_BACKOFF_ENABLE`。
+- 候选抽取（按机场分组采样）：从**全部**延迟候选里，每个机场（colo）取延迟最低的 `COLO_PICK`（5）个，
+  强制每个机场都有代表进快筛；不足 `DL_TOPN`（24）时按延迟顺位回填；`COLO_PICK=0` 退化为纯延迟顺位。
+- 快筛：入选候选逐个（串行）下载 `FAST_URL`（1MB）1 次，`curl --resolve` 强制 IP、`--max-time $DL_MAXTIME`。
+- **速度口径 = 稳态速度**：`size_download / (time_total - time_starttransfer)`，剔除 TCP/TLS 握手与首包等待。
+  实测同一 IP：1MB 样本按 curl `speed_download` 只有真实值的 1/2.4~1/4（握手占比过半）；9.1MB 样本相差 6%~14%。
+- **失败处理**：429 走指数退避重试；`000`（超时）/`5xx` 也重试（间隔 3s）；超过 `DL_RETRY` 次 → **该候选直接剔除**（v2 之前是记 0 分，导致 0.00MB/s 条目进过榜）。
+- **淘汰赛**（v2 改动）：以本轮有效样本的速度中位数为基准，**低于 60% 的剔除**；幸存不足 `FAST_TOPN` 时按速度补足。
+  实测：中位 0.80MB/s → 门槛 0.48MB/s，24 个里砍掉 2 个。
+- **定序**：`PICK_MODE=lat`（默认）→ 幸存者按延迟升序；`speed` → 按快筛速度降序（旧行为）。
+- 为什么不再按快筛排序：1MB 样本与 9MB 精测的 Spearman 相关性只有 **0.42~0.94（均值 0.71）**，
+  且对低延迟机场**系统性低估更狠**（MAA 2.36× vs BOM 1.68×），按它排等于让噪声决定谁进精测——
+  历史多轮里"快筛第 1 名"在精测中掉到第 7~12 名。
+- 配置项：`DL_TOPN=24`、`COLO_PICK=5`、`FAST_URL`、`DL_MAXTIME=10`、`DL_RETRY=3`、`PICK_MODE=lat`。
 
 ### 4a-2. 多样性筛选（快筛 → 精测的入选名单）
-- 从快筛速度榜选 `FAST_TOPN` 个进入精测，约束：**同一 /48 最多 `DIV_SEG_MAX` 条、同地区（机场码）最多 `DIV_COLO_MAX` 条**。
-- 三级筛选：① 严格约束直选（同段≤`DIV_SEG_MAX`、同地区≤`DIV_COLO_MAX`）
-  ② 不足时放宽一档回填（同段≤3、同地区≤5）  ③ 仍不足按速度顺位无条件回填（保证数量）。
-  注意 awk 必须 `-F"|"`：FASTTMP 是竖线分隔无空格，缺了它 $3/$4 全空、筛选退化成纯速度序
-  （上线首日实际发生并已修复的 bug）。
-- 配置项：`V6_FAST_TOPN=10`、`V6_DIV_SEG_MAX=2`、`V6_DIV_COLO_MAX=3`。
+- 从**已定序**的幸存名单取 `FAST_TOPN`（16）个进入精测，约束：**同一 /48 最多 `DIV_SEG_MAX`（2）条、同地区（机场码）最多 `DIV_COLO_MAX`（7）条**。
+- 三级筛选：① 严格约束直选（同段≤2、同地区≤7）
+  ② 不足时放宽一档回填（同段≤3、同地区≤9）  ③ 仍不足按顺位无条件回填（保证数量）。
+- 注意：awk 必须 `-F"|"`（FASTTMP 是竖线分隔无空格）；**名额收紧到 16 后 `DIV_COLO_MAX=7` 开始成为约束**——
+  实测输出会变成 MAA×7 + BOM×5 + DEL×2，若更看重"榜单里都最快"可把 `DIV_COLO_MAX` 提到 9。
+- 配置项：`FAST_TOPN=16`、`DIV_SEG_MAX=2`、`DIV_COLO_MAX=7`。
 
 ### 4b. 精测
-- 入选名单逐个下载 `DL_URL`（9.1MB）`DL_RUNS` 次取平均；429 处理同快筛。
-- 配置项：`V6_DL_URL`、`V6_DL_MAXTIME`、`V6_DL_RETRY`、`V6_DL_RUNS=1`。
+- 入选名单逐个下载 `DL_URL`（9.1MB）**`DL_RUNS=2` 次取平均**（整数除法），口径同上（稳态速度）。
+- **全部样本失败（AVG=0）→ 剔除，不写榜**（v2 之前会以 0.00MB/s 进入结果文件）。
+- 单轮精测 16×2=32 次下载，约 292MB、181s。
+- 配置项：`DL_URL`、`DL_MAXTIME=10`、`DL_RETRY=3`、`DL_RUNS=2`。
 
 ### 5. 排序输出 + 归档
-- 精测速度降序取前 `TOPN` → `v6/$RESULT_FILE`（文件名由 config 的 `V6_RESULT_FILE` 决定，如 `best_ip_v6_yidong.txt`）；首行 `# updated: 时间戳`，行格式 `[ip]:443#ip-443-延迟ms-速度MB/s-地区`。
-- 归档 `history/best_时间戳.txt`，**超过 `KEEP` 份删最旧**。
-- 日志记完成行（最优 IP/延迟/速度/候选数/上榜数；速度 ≥`SPEED_PASS` 附加"达标"标注）。
-- 配置项：`V6_TOPN=10`、`V6_KEEP=48`、`V6_SPEED_PASS=8`、`LOG_KEEP_LINES=500`。
+- 精测速度降序取前 `TOPN=15` → `v6/$RESULT_FILE`（文件名由 `V6_RESULT_FILE` 决定，如 `best_ip_v6_yidong.txt`）；
+  首行 `# updated: 时间戳`，行格式 `[ip]:443#ip-443-延迟ms-速度MB/s-地区`（v4 无方括号）。
+- 归档 `history/best_时间戳.txt`，**超过 `KEEP=48` 份删最旧**（学习机制的输入，不可随意清空）。
+- 完成日志一行含：最优 IP / 延迟 / 速度 / 粗筛幸存数 / 延迟候选数 / 快筛数 / 精测数 / 上榜数 / **本轮下载流量** / 机场分布；
+  速度 ≥ `SPEED_PASS=3.0` 时附加"达标"标注（实测上限 4.07MB/s，旧值 8 永远不触发）。
+- 日志：`v6/run.log` 保留最近 `LOG_KEEP_LINES=1000` 行（约 10 轮）；`v6/cfst_run.log` 每轮按 `tail -c 20000` 修剪
+  （cfst 进度条用 `\r` 覆写、无换行，`tail -n` 无效）。
 
 ---
 
@@ -158,17 +206,17 @@ cron（17 0,6-23 * * *，系统 crontab 写死，不在 config.txt）
 
 | 项 | v6 | v4 |
 |---|---|---|
-| 归一化基准 | /48（粗于 /44 跳过） | /24（粗于 /20 跳过；/20~/23 展开，`int(第三段/q)*q` 容错未对齐写法） |
+| 归一化基准 | /48（粗于 /44 跳过） | /24（粗于 /20 跳过；/20~/23 展开） |
 | 段展开目标格式 | 随机 IPv6（字符串运算） | 随机 IPv4（数字运算，/24 避开 .0/.255） |
 | 学习定向 1b-2 | 有（/64 邻域） | 无（/24 空间太小，展开已近穷举） |
 | 学习 key | 前 3 组 hex（包含匹配） | `x.y.z.0/24` 全字匹配（grep -Fxf） |
 | 多样性段键 | /48（前 3 组） | /24（前三段） |
 | 结果行格式 | `[ip]:443#...`（带方括号） | `ip:443#...`（无方括号） |
 | cfst 池形态 | 全裸 IP（/128 逐条） | 全裸 IP（/32 逐条） |
-| SELF_LAT | 250 | 300（v4 直连延迟普遍 205~227ms，250 会零候选） |
+| SELF_LAT | 200 | 250（v4 直连延迟普遍 62ms HKG / 205~227ms 美西，250 兼顾） |
 | 历史解析字段 | FS=`[][#-]`，$6=延迟 | FS=`[-#]`，$4=延迟 |
 
-其余流程、分支、退避、两阶段下载完全同构。
+其余流程、分支、退避、两段式延迟、淘汰赛、双样本精测完全同构。当前线上 `V4_ENABLE=0`（v4 已停用，最近一次 15:28：HKG 62.99ms / 3.62MB/s）。
 
 ---
 
@@ -179,9 +227,12 @@ cron（17 0,6-23 * * *，系统 crontab 写死，不在 config.txt）
 3. `gh_put` 流程：
    - **去重**：除首行时间戳外的内容 md5 与 `.push_v6/v4.md5` 比对，一致 → 跳过提交（减 commit 噪音）；
    - GET 取现有文件 sha → PUT Contents API；
-   - **双通道**：直连 api.github.com 失败（网络层）→ 自动改走 `http://127.0.0.1:GH_PROXY_PORT` 重试一次；
+   - **双通道 + 回合重试**（v2）：`direct → proxy(127.0.0.1:$GH_PROXY_PORT)` 算一个回合；
+     传输失败或 **HTTP 500/502/503/504/429** 都算临时性失败，最多重试 `GH_RETRY=3` 个回合（间隔 3s）；
+     其它 4xx（如 401 鉴权失败）立即返回，不浪费重试。
+     （v2 之前 5xx 直接判失败：11-04 18:11 就因一次 502 丢掉整轮榜单。）
    - 成功后 purge `purge.jsdelivr.net`（响应含 `"status": "finished"` 判定成功）。
-4. **status 文件**（每轮必传，不去重，文件名 = `$STATUS_FILE`）：两栈最后一条关键日志（测速完成/放弃原因，含**机场分布**）+ 退出码 + 本轮上传结果 → 仓库，打开 raw 链接即可知道系统健康状态和多样性是否生效。
+4. **status 文件**（每轮必传，不去重，文件名 = `$STATUS_FILE`）：两栈最后一条关键日志（测速完成/放弃原因，含**机场分布**）+ 退出码 + 本轮上传结果 → 仓库，打开 raw 链接即可知道系统健康状态。
 
 ---
 
@@ -190,43 +241,47 @@ cron（17 0,6-23 * * *，系统 crontab 写死，不在 config.txt）
 | 分组 | 配置项 | v6 值 | v4 值 | 说明 |
 |---|---|---|---|---|
 | 开关 | GH_UPLOAD_ENABLE | 1 | — | 是否上传 GitHub |
-| 开关 | V6/V4_ENABLE | 1 | 1 | 各栈测速总开关 |
-| GitHub | GH_REPO / GH_TOKEN / GH_PROXY_PORT | — | — | 仓库 / token / 代理端口 |
+| 开关 | V6/V4_ENABLE | 1 | 0 | 各栈测速总开关 |
+| GitHub | GH_REPO / GH_TOKEN / GH_PROXY_PORT | — | — | 仓库 / token（600 权限）/ 代理端口 7890 |
 | GitHub | GH_CONNECT_TIMEOUT / GH_MAXTIME / GH_PURGE_TIMEOUT | 6 / 25 / 15 | 同 | API 连接/请求/purge 超时(秒) |
 | 通用 | SRC_CONNECT_TIMEOUT / SRC_FETCH_TIMEOUT | 8 / 30 | 同 | 段源连接/整体超时(秒) |
-| 通用 | SRC_RETRY | 2 | 同 | 段源拉取失败重试次数（0=不重试） |
+| 通用 | SRC_RETRY | 2 | 同 | 段源拉取失败重试次数 |
 | 通用 | PRECHECK_TIMEOUT / PROBE_TIMEOUT / DL_CONNECT_TIMEOUT | 12 / 15 / 5 | 同 | 预检/429探测/下载连接超时(秒) |
-| 通用 | LOG_KEEP_LINES | 500 | 同 | 日志瘦身保留行数 |
-| 结果筛选 | TOPN | 10 | 10 | 最终上榜条数 |
-| 结果筛选 | DL_TOPN | 30 | 30 | 延迟榜进快筛名额 |
-| 结果筛选 | FAST_TOPN | 10 | 10 | 快筛进精测名额 |
-| 结果筛选 | COLO_PICK | 3 | 3 | 快筛每机场（colo）最多入选数（0=关分组采样） |
-| 结果筛选 | DIV_SEG_MAX | 2 | 2 | 同 /48(v6)//24(v4) 上榜上限 |
-| 结果筛选 | DIV_COLO_MAX | 3 | 3 | 同地区上榜上限 |
+| 通用 | LOG_KEEP_LINES | 1000 | 同 | 运行日志保留行数（约 10 轮） |
+| 结果筛选 | TOPN | 15 | 15 | 最终上榜条数 |
+| 结果筛选 | DL_TOPN | 24 | 24 | 延迟榜进快筛名额（原 45，快筛只做门槛后收紧） |
+| 结果筛选 | FAST_TOPN | 16 | 16 | 快筛进精测名额（比 TOPN 多 1~3 个留挑选余地） |
+| 结果筛选 | COLO_PICK | 5 | 5 | 快筛每机场最多入选数（0=关分组采样） |
+| 结果筛选 | DIV_SEG_MAX | 2 | 2 | 同 /48(v6)//24(v4) 上限 |
+| 结果筛选 | DIV_COLO_MAX | 7 | 7 | 同地区上限（名额收紧后此值开始成为约束） |
 | 池构建 | SEG_PICK | 20 | 20 | 每轮入池段总数 |
-| 池构建 | AVOID_KEEP | 48 | 48 | 随机段探索去重窗口（避开最近抽中条数，0=关闭） |
+| 池构建 | AVOID_KEEP | 48 | 48 | 随机段探索去重窗口（0=关闭） |
 | 池构建 | LEARN_MAX | 8 | 8 | 学习段封顶 |
-| 池构建 | LEARN_WINDOW | 24 | 24 | 学习段滑动窗口（只统计最近份数，0=不限） |
+| 池构建 | LEARN_WINDOW | 24 | 24 | 学习段滑动窗口（0=不限） |
 | 池构建 | IPS_PER_SEG | 200 | 200 | 订阅段每段展开随机 IP 数（0=关闭） |
-| 池构建 | LOCAL_IPS_PER_SEG | 20 | 20 | 本地优选段每段展开随机 IP 数（手写段确定性全进，用更小值控制总量） |
-| 池构建 | TGT_PER_IP | 25 | （无） | 好 IP /64 邻域定向数（v4 无此项） |
-| 池构建 | TGT_MAX_PREFIX | 16 | （无） | 定向 /64 前缀数量上限（v4 无此项） |
+| 池构建 | LOCAL_IPS_PER_SEG | 254 | 254 | 本地优选段每段展开随机 IP 数 |
+| 池构建 | TGT_PER_IP | 25 | （无） | 好 IP /64 邻域定向数 |
+| 池构建 | TGT_MAX_PREFIX | 16 | （无） | 定向 /64 前缀数量上限 |
 | 池构建 | IP_PICK | 100 | 100 | 外部纯 IP 抽样配额 |
-| 池构建 | SELF_MIN / SELF_LAT | 2 / 250 | 2 / 300 | 学习段阈值（前缀上榜轮次）/ 复测与学习延迟上限（LAT 是两栈唯一数值差异） |
-| 稳定性 | KEEP | 48 | 48 | 历史归档份数 |
+| 池构建 | SELF_MIN / SELF_LAT | 2 / 200 | 2 / 250 | 学习段阈值（前缀上榜轮次）/ 复测与学习延迟上限 |
+| 稳定性 | KEEP | 48 | 48 | 历史归档份数（学习输入，勿清空） |
 | 稳定性 | MAX_SCAN_ROUNDS | 30 | 30 | 延迟测速最大重扫轮数 |
 | 稳定性 | BACKOFF_ENABLE | 1 | 1 | 429 指数退避开关 |
 | 稳定性 | BACKOFF_BASE / BACKOFF_CAP | 120 / 600 | 同 | 退避基础间隔/封顶(秒) |
-| 稳定性 | 429_WAIT_MAX | 1200 | 1200 | 429 累计等待上限(秒) |
-| 稳定性 | TIMEUP | 2400 | 2400 | 单轮总超时(秒)，留 429 退避余量 |
-| 测速参数 | LAT_THREAD | 48 | 48 | cfst 并发线程（提速 ~1/3，最高建议 64） |
-| 测速参数 | LAT_TIMEOUT | 1 | 1 | 延迟测速单 IP 超时(秒) |
+| 稳定性 | 429_WAIT_MAX | 600 | 600 | 429 累计等待上限(秒)（原 1200，收敛到 10 分钟） |
+| 稳定性 | TIMEUP | 1200 | 1200 | 单轮总超时(秒)（原 2400，避免挂起轮次跨过下一 cron） |
+| 测速参数 | LAT_THREAD | 48 | 48 | cfst 并发线程（内存紧张时降到 24~32） |
+| 测速参数 | LAT_TIMEOUT | 1 | 1 | **第一段**每 IP 探测次数（cfst `-t`，不是超时） |
+| 测速参数 | LAT_TRYS | 4 | 4 | **第二段**每 IP 探测次数（4 次取平均压抖动） |
+| 测速参数 | LAT_LOSS | 0.2 | 0.2 | 第二段丢包上限（cfst `-tlr`，4 丢 1 = 0.25 淘汰） |
+| 测速参数 | OOM_THREAD | 24 | 24 | 启动期 OOM 后降到的并发（重试 1 次） |
 | 测速参数 | DL_MAXTIME | 10 | 10 | 单次下载限时(秒) |
-| 测速参数 | DL_RETRY | 3 | 3 | 下载 429 重试上限 |
-| 测速参数 | DL_RUNS | 1 | 1 | 精测每候选下载次数（取平均，1 省流量） |
-| 测速参数 | SPEED_PASS | 8 | 8 | 达标速度阈值 MB/s（仅日志标注） |
+| 测速参数 | DL_RETRY | 3 | 3 | 下载失败（429/超时/5xx）重试上限 |
+| 测速参数 | DL_RUNS | 2 | 2 | 精测每候选下载次数（取平均，压 10~20% 单样本噪声） |
+| 测速参数 | PICK_MODE | lat | lat | 快筛幸存者定序：lat=延迟优先 / speed=速度优先（旧行为） |
+| 测速参数 | SPEED_PASS | 3.0 | 3.0 | 达标速度阈值 MB/s（仅日志标注） |
 | 测速目标 | LAT_URL | cp.cloudflare.com/generate_204 | 同 | 勿用 www.cloudflare.com（WAF） |
-| 测速目标 | FAST_URL | cdnjs echarts 1MB | 同 | 快筛源（只做粗排，1MB 省 2/3 流量） |
+| 测速目标 | FAST_URL | cdnjs echarts 1MB | 同 | 快筛源（只做门槛，1MB 足够分辨"明显不行"） |
 | 测速目标 | DL_URL | testingcf.jsdelivr typescript 9.1MB | 同 | 勿用 cdn.jsdelivr.net 主域（已迁 Fastly） |
 
 ---
@@ -235,17 +290,19 @@ cron（17 0,6-23 * * *，系统 crontab 写死，不在 config.txt）
 
 | 类别 | 内容 |
 |---|---|
-| 路径 | `/data/cfst`、`v6/`、`v4/`、`history/`、锁文件 `.run.lock`、`.push_*.md5`、`.gh_resp`、`.status.txt` |
-| cron | `17 0,6-23 * * *`（系统 crontab，不在 config） |
-| cfst 固定参数 | `-httping -dd -p 10 -httping-code 204`；延迟门槛走 `-tl $SELF_LAT`（可配） |
+| 路径 | `/data/cfst`、`v6/`、`v4/`、`history/`、锁文件 `.run.lock`、`.push_*.md5`、`.gh_resp`、`.status.txt`、`.bytes`、`.lat1.*` |
+| cron | 10 轮/天：`17 0,6,8,10,12,14,16,18,20,22 * * *`（每 2 小时一轮、错开整点，01:00-06:00 不跑；系统 crontab，不在 config） |
+| cfst 固定参数 | `-httping -dd -p 0 -httping-code 204`；延迟门槛 `-tl`、丢包 `-tlr`、探测次数 `-t` 均走配置 |
+| 两段式常数 | 第一段门槛 = `SELF_LAT + 60`；第二段必须带 `-tlr` |
+| 淘汰门槛 | 快筛中位数的 **60%**（`FLOOR=$((MED * 6 / 10))`） |
 | 归一化基准 | v6=/48、下限 /44；v4=/24、下限 /20（算法常数，改需同步脚本） |
-| 定向学习 | /64 粒度（/64 前缀上限 TGT_MAX_PREFIX 可配） |
-| 随机种子 | `head -c 8 /dev/urandom \| md5sum \| cut -c1-8`，兜底值 `1a2b3c4d` / `9f8e7d6c` / `4d3c2b1a` |
+| 定向学习 | /64 粒度（前缀上限可配） |
+| 随机种子 | `head -c 8 /dev/urandom \| md5sum \| cut -c1-8`，兜底值 `1a2b3c4d` / `9f8e7d6c` |
 | 回退下载源 | `speed.cloudflare.com/__down`（5MB/10MB，预检失败时官方兜底） |
-| 展开细节 | v6 保留前 `掩码/4` 位 hex；v4 /24 避开 .0/.255、粗段全段随机 |
-| 测量次数 | 快筛每候选 1 次、精测每候选 `DL_RUNS` 次取平均（已配置化，默认 1） |
-| busybox 适配 | `timeout -t`（GNU 语法会 127 假跑！）、sort 无 -o/-k1,1n、无 od/cksum、scp 不可用（cat 管道）、srand 大数截断 |
-| cfst 机制 | 一条 v4 段只产 1 个随机 IP；v6 游走每条 /48 ≈ 数百个且偏向段头（现已被脚本展开替代） |
+| 日志修剪 | `cfst_run.log` 每轮 `tail -c 20000`；`run.log` 保留 `LOG_KEEP_LINES` 行 |
+| GH 重试 | `GH_RETRY` 默认 3 回合，可被 config 覆盖 |
+| busybox 适配 | `timeout -t`（GNU 语法会 127 假跑）；**`sort -k` 静默无效**（延迟定序改用"字段换位 + `sort -n`"）；`sort` 无 `-o`；无 `nohup`/`setsid`；`scp`/`sftp` 不可用（base64 + cat 管道）；`awk` 无 `asort`、`srand` 大数截断 |
+| cfst 机制 | 一条 v4 段只产 1 个随机 IP；v6 游走每条 /48 ≈ 数百个且偏向段头（现已被脚本展开替代）；`-p` 是显示条数不是探测间隔 |
 
 ---
 
@@ -262,13 +319,68 @@ history/ ──上轮best──> .p3 自建池(复测+定向)
               .p3.tgt      (key命中段)            .seg.pick
                   └───────┬──────┴──────────┬──────────┘
                           ▼   1d-2 段展开     ▼
-                    pool.txt = 展开IP + 定向IP + 自建池 + 外部IP抽的IP
+                    pool.txt = 展开IP + 定向IP + 学习复测 + 自建池 + 外部IP
                           ▼
-              cfst HTTPing(-tl SELF_LAT) → .lat.csv
+         cfst HTTPing 两段式：t=1@SELF_LAT+60 → t=4@SELF_LAT + 丢包≤0.2 → .lat.csv
                           ▼
-              快筛(前DL_TOPN, 1MB) → 三级多样性筛选 → 精测(前FAST_TOPN, 9.1MB x DL_RUNS)
+     快筛(COLO_PICK分组取前DL_TOPN, 1MB, 稳态速度) → 中位60%淘汰
                           ▼
-              $RESULT_FILE (TopN) + history/ 归档
+         PICK_MODE 定序(lat) → 三级多样性筛选 → 精测(前FAST_TOPN, 9.1MB x 2 次取平均)
+                          ▼   AVG=0 剔除
+                 $RESULT_FILE (TopN) + history/ 归档
                           ▼ (run.sh 统一调度)
-              githubpush.sh → $V6/V4_RESULT_FILE + $STATUS_FILE → GitHub/jsDelivr
+        githubpush.sh → $V6/V4_RESULT_FILE + $STATUS_FILE → GitHub/jsDelivr
 ```
+
+---
+
+## 7. v2 变更记录（2026-11-04）
+
+| # | 改动 | 原因（实测依据） | 代价 |
+|---|---|---|---|
+| 1 | 延迟测速改两段式（`t=1@SELF_LAT+60` → `t=4@SELF_LAT -tlr 0.2`） | 单样本平均延迟噪声极大（同 IP 单次 68ms / 4 次 110ms）；`-tl 250` 通过率 54~88%，等于没筛 | 延迟阶段 110s → 190s |
+| 2 | `-p 10` → `-p 0` | `-p` 是"控制台显示条数"，旧注释误标为"端口探测间隔" | 无 |
+| 3 | 速度口径改稳态：`size/(total - ttfb)` | curl `speed_download` 把握手算进分母：1MB 样本低估 2.4~4 倍，9.1MB 样本低估 6~14% | 无 |
+| 4 | 快筛改为"淘汰赛 + 不定序"（中位 60% 门槛，幸存按延迟排序） | 1MB 快筛与 9MB 精测 Spearman 仅 0.42~0.94（均值 0.71），且 MAA 被低估 2.36× 而 BOM 仅 1.68× | 无 |
+| 5 | 精测 `DL_RUNS 1 → 2` | 同一 IP 连续 3 次 9.1MB 可差 10~20%（3.20/2.16/3.01） | 流量翻倍的一半 |
+| 6 | `DL_TOPN 45→24`、`FAST_TOPN 15→16`（曾试 20） | 45 个里真正有戏的不到 16 个；16 保留 1 个可淘汰名额，精测段流量从 366MB 压到 292MB | 整轮约 300MB |
+| 7 | 失败样本（`000`/5xx/429 超限）从"记 0 分"改为"剔除" | 历史有 4 条 `0.00MB/s` 进过榜 | 无 |
+| 8 | 精测 AVG=0 → 剔除不写榜；精测全失败则放弃本轮（保留旧榜） | 防止用空榜覆盖可用榜单 | 无 |
+| 9 | `SELF_LAT 250→200`（v4 300→250） | PDX/SEA/LAX（200~215ms）实测中位 0.55~0.72MB/s，纯占名额 | 候选 -23% |
+| 10 | `429_WAIT_MAX 1200→600`、`TIMEUP 2400→1200` | 正常一轮 200~340s；2400s 会让挂起轮次跨过下一 cron（11-03 21:32 吞掉一整轮） | 极端 429 场景提前放弃 |
+| 11 | GitHub 5xx/429 回合重试（`GH_RETRY=3`） | 11-04 18:11 因一次 502 丢掉整轮榜单，手动重发即 200 | 无 |
+| 12 | `cfst_run.log` 每轮 `tail -c 20000` | 两段式把两遍进度条追加进同一文件，涨到 ~100KB/轮写入 UBI | 无 |
+| 13 | 启动期 OOM 检测 + 降并发重试 | `v4/run.log` 留有 Go 启动期 OOM 栈，旧逻辑会空转 30 轮 | 无 |
+| 14 | `SPEED_PASS 8→3.0`、`LOG_KEEP_LINES 500→1000` | 8 从未触发（上限 4.07）；500 行只能回看 7 轮 | 日志略大 |
+| 15 | 流量计量修正：`.bytes` 清空点从"精测前"移到"快筛前" | 原统计漏掉快筛的 ~24MB/轮（日志报 279MB，实际整轮 303MB） | 无 |
+| 16 | 调度从 19 轮/天改为 **10 轮/天**（01:00-06:00 停跑，其余每 2 小时一轮，错开整点 :17） | 19 轮≈5.8GB/天；01-06 点与 19-23 点的榜单中位速度 <0.8MB/s，测了也没人用 | 流量 5.8→3.0GB/天；最长空窗 6 小时（00:17→06:17） |
+
+**三种配置的实测对比（同一台移动路由）**
+
+| 配置 | 耗时 | 流量（整轮） | 榜首 / 尾部 | 备注 |
+|---|---|---|---|---|
+| 旧版（45/15/1 次） | 268s | ≈182MB | 2.67 / 1.25 | 单段延迟、快筛排序；无计量，按公式估算 |
+| 试跑（24/20/2 次） | 485s | ≈370MB | 2.48 / 1.45 | 精测段 346MB + 快筛 24MB |
+| 现行（24/16/2 次） | 431s | ≈303MB | 2.30 / 1.46 | 精测段 279MB + 快筛 24MB；18:28 晚高峰 |
+
+> 流量口径：脚本内 `.bytes` 累加**每次成功下载的实际字节数**（含 429/超时的重复下载）。以上是 **v6 单栈**；v4 同构，全开时流量与耗时都约翻倍。
+
+> 结论：榜首速度主要由**时段**决定（06~11 点中位 3.2MB/s，12~17 点 1.2~1.5，19~23 点 0.4~0.7），改动影响的是**稳定性与尾部质量**，不是峰值。
+
+---
+
+## 8. 运维速查
+
+| 场景 | 操作 |
+|---|---|
+| 看系统健康 | `cat /data/cfst/.status.txt` 或仓库里的 `status_*.txt`（含两栈最后一条完成日志 + 机场分布） |
+| 看本轮细节 | `tail -50 /data/cfst/v6/run.log`（每轮 ~40 行：池构建/快筛/精测/汇总） |
+| 手工跑一轮 | `sh /data/cfst/run.sh`（会连带上传 GitHub；只想本地测就 `sh /data/cfst/run_v6.sh`） |
+| 临时停跑 | `crontab -l` 里把 `17 0,6,8,...` 那行前加 `#` |
+| 调轮次 | 就一行 cron，小时列表即全部排期：改间隔/时段直接改小时数字（如 `17 6-22/2` = 9 轮） |
+| 只测 v6 | `V4_ENABLE=0`（当前就是），v4 的结果文件会停在最后一次成功的时间戳 |
+| 流量吃紧 | 优先降 `FAST_TOPN`（每减 1 个 = 省 2×9.1=18.2MB/轮），其次 `DL_RUNS=1`（直接省一半，约 146MB），最后关 v4 |
+| 榜单要更多 MAA | `DIV_COLO_MAX` 7→9 |
+| 内存告警 | `free -m` 看剩余；`LAT_THREAD` 降到 32、`OOM_THREAD` 24 |
+| 磁盘告警 | `/data` 是 23MB UBI 分区；`du -sh /data/cfst/v6 /data/cfst/v4`，`history/` 由 `KEEP` 控制 |
+| 全量回滚 | 无现成备份时按 config.txt 里每条参数的"【调优】原值 → 新值"注释改回即可 |

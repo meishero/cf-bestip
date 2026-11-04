@@ -22,13 +22,17 @@
 # 1a-2 段归一化（与 v6 同构，基准 /24）：细于 /24 原样保留；/20~/23 展开为
 #    对应 /24 行（最多 16 条）参与去重与学习匹配；粗于 /20（/16 /13 等）
 #    展开量过大（256~65536 条）跳过并记日志
-# 2. HTTPing 延迟测速（-tl $SELF_LAT）：失败则等 429 解除后重扫；循环直到成功（上限 30 轮防死转）
+# 2. HTTPing 延迟测速两段式：t=1 粗扫（上限 SELF_LAT+60）→ 幸存者 t=LAT_TRYS 次取平均
+#    + 丢包上限 LAT_LOSS（上限 SELF_LAT）；失败则等 429 解除后重扫（上限 30 轮防死转）
 # 3. 下载闸门：探测下载 URL，429 等到解除才开测
 # 4. 下载实测两阶段：
-#    4a 快筛：候选（最多 30 个）每个下载 1 次 x 1MB（echarts.min.js），按速度粗排
-#    4b 精测：多样性筛选后前 10 名每个下载 DL_RUNS 次 x 9.1MB 取平均
-#    任何一次撞 429 等 120 秒重试，单次样本重试上限 3 次，超限记 0 跳过
-# 5. 排序：下载速度降序，取前 10 → 结果文件（文件名由 config.txt 的 V4_RESULT_FILE 决定，可配）
+#    4a 快筛：候选（DL_TOPN 个）每个下载 1 次 x 1MB（echarts.min.js），只做淘汰门槛：
+#       低于本轮速度中位数 60% 的剔除，幸存者按 PICK_MODE 定序（lat=延迟优先 / speed=速度优先）
+#    4b 精测：多样性筛选后前 FAST_TOPN 名每个下载 DL_RUNS 次 x 9.1MB 取平均；全样本失败的直接剔除
+#    任何一次失败（429 / 超时 / 5xx）重试，单次样本重试上限 DL_RETRY 次
+#    【v2】速度口径改为"稳态速度" = 下载量/(总耗时-首字节耗时)，剔除握手与慢启动，
+#       修正原 speed_download 口径 15%~70% 的系统性低估
+# 5. 排序：下载速度降序，取前 TOPN → 结果文件（文件名由 config.txt 的 V4_RESULT_FILE 决定，可配）
 #    行格式：ip:443#ip-443-延迟ms-速度MB/s-地区（IPv4 不带方括号）
 #    例：104.16.10.126:443#104.16.10.126-443-212ms-5.45MB/s-LAX
 #    history/（结果归档，反哺自建学习池 + 段级学习）
@@ -36,9 +40,9 @@
 # 【配置】全部参数已迁移至 /data/cfst/config.txt 统一维护
 #   （v6/v4 独立配置段 + 三个总开关：GH_UPLOAD_ENABLE / V6_ENABLE / V4_ENABLE）
 # 【参数速查】（数量类配额已与 v6 版对齐，统一见 config.txt）
-#   每轮 20 段（每段展开 200 个随机 IP ≈ 4000 个段候选）/ 延迟候选取前 30 /
+#   每轮 20 段（每段展开 200 个随机 IP ≈ 4000 个段候选）/ 延迟候选取前 DL_TOPN /
 #   快筛 1MB x 1 次 / 精测 9.1MB x DL_RUNS 次
-#   每轮下载流量上限 ≈ 30x1MB + 10x18.2MB ≈ 210MB（正常远低于此）
+#   每轮下载流量 ≈ DL_TOPNx1MB + FAST_TOPNxDL_RUNSx9.1MB（轮末日志会打印实际值）
 #   429 重试上限 3 次/样本；下载锁 = PID 存活检测（防叠跑）
 # ============================================================
 PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH
@@ -80,6 +84,10 @@ COLO_PICK="$V4_COLO_PICK"; [ -z "$COLO_PICK" ] && COLO_PICK=3
 # 学习复测每学习段最多复测的精确 IP 数（v4 复用 v6 定向值；config 无 V4_TGT_PER_IP 时默认 25）
 TGT_PER_IP="${V4_TGT_PER_IP:-25}"; [ -z "$TGT_PER_IP" ] && TGT_PER_IP=25
 SPEED_PASS="$V4_SPEED_PASS"; [ -z "$SPEED_PASS" ] && SPEED_PASS=8
+LAT_TRYS="$V4_LAT_TRYS"; [ -z "$LAT_TRYS" ] && LAT_TRYS=4
+LAT_LOSS="$V4_LAT_LOSS"; [ -z "$LAT_LOSS" ] && LAT_LOSS=0.2
+PICK_MODE="$V4_PICK_MODE"; [ -z "$PICK_MODE" ] && PICK_MODE=lat
+OOM_THREAD="$V4_OOM_THREAD"; [ -z "$OOM_THREAD" ] && OOM_THREAD=24
 SRC_CONNECT_TIMEOUT="${SRC_CONNECT_TIMEOUT:-8}"
 SRC_FETCH_TIMEOUT="${SRC_FETCH_TIMEOUT:-30}"
 SRC_RETRY="${SRC_RETRY:-2}"
@@ -143,35 +151,58 @@ wait_429_clear() {
     done
 }
 
-# 单次下载（带 429 重试，上限 DL_RETRY 次）：参数1=URL 参数2=IP
-# host 从 URL 自动解析（快筛/精测可用不同 CDN 域名）
-# 成功输出 speed_download，超限输出空值
+# 单次下载（429 与网络失败都重试，上限 DL_RETRY 次）：参数1=URL 参数2=IP
+# 【v2】输出"稳态速度"(B/s) = 下载量 / (总耗时 - 首字节耗时)：curl 的 %{speed_download}
+#   把 TCP/TLS 握手与首包等待算进分母，实测系统性低估 15%（9MB 样本）~70%（1MB 快筛样本）。
+# 【v2】除 429 外的失败（000 超时 / 5xx）也重试，不再当成 0 MB/s 样本写进榜单。
+# 成功输出速度（B/s），重试超限输出空串；累计下载字节数写 .bytes 供轮末统计流量。
 dl_once() {
-    DH=$(echo "$1" | sed -E 's|^https?://([^/]+)/.*|\1|')
+    DU="$1"; DIP="$2"
+    DH=$(echo "$DU" | sed -E 's|^https?://([^/]+)/.*|\1|')
     # IPv6 目标地址需方括号，IPv4 不需要
-    if echo "$2" | grep -q ':'; then TGT="[$2]"; else TGT="$2"; fi
+    if echo "$DIP" | grep -q ':'; then TGT="[$DIP]"; else TGT="$DIP"; fi
     TRY=0
     while :; do
-        RESP=$(curl -k -o /dev/null -s -w "%{http_code} %{speed_download}" --connect-timeout "$DL_CONNECT_TIMEOUT" --max-time $DL_MAXTIME \
-               --resolve "$DH:443:$TGT" "$1" 2>/dev/null)
-        CODE=${RESP%% *}
-        if [ "$CODE" != "429" ]; then
-            echo "${RESP##* }"
-            return 0
-        fi
-        TRY=$((TRY + 1))
-        if [ "$TRY" -gt "$DL_RETRY" ]; then
-            echo "[$(date '+%m-%d %H:%M:%S')]   下载 $2 连续 429 超过 $DL_RETRY 次重试，放弃该次样本" >> "$LOG"
-            echo ""
-            return 1
-        fi
-        if [ "$BACKOFF_ENABLE" = "1" ]; then
-            case $TRY in 1) SLP=$BACKOFF_BASE;; 2) SLP=$((BACKOFF_BASE*2));; *) SLP=$((BACKOFF_BASE*4));; esac
-        else
-            SLP=$BACKOFF_BASE
-        fi
-        echo "[$(date '+%m-%d %H:%M:%S')]   下载 $2 撞 429 限流，等待 ${SLP}s 后重试（$TRY/$DL_RETRY）" >> "$LOG"
-        sleep "$SLP"
+        RESP=$(curl -k -o /dev/null -s \
+               -w "%{http_code} %{size_download} %{time_starttransfer} %{time_total}" \
+               --connect-timeout "$DL_CONNECT_TIMEOUT" --max-time $DL_MAXTIME \
+               --resolve "$DH:443:$TGT" "$DU" 2>/dev/null)
+        CODE=${RESP%% *}; REST1=${RESP#* }
+        SIZE=${REST1%% *}; REST2=${REST1#* }
+        TTFB=${REST2%% *}; TOT=${REST2##* }
+        case "$CODE" in
+            2*) ;;
+            429)
+                TRY=$((TRY + 1))
+                if [ "$TRY" -gt "$DL_RETRY" ]; then
+                    echo "[$(date '+%m-%d %H:%M:%S')]   下载 $DIP 连续 429 超过 $DL_RETRY 次重试，放弃该次样本" >> "$LOG"
+                    echo ""
+                    return 1
+                fi
+                if [ "$BACKOFF_ENABLE" = "1" ]; then
+                    case $TRY in 1) SLP=$BACKOFF_BASE;; 2) SLP=$((BACKOFF_BASE*2));; *) SLP=$((BACKOFF_BASE*4));; esac
+                else
+                    SLP=$BACKOFF_BASE
+                fi
+                echo "[$(date '+%m-%d %H:%M:%S')]   下载 $DIP 撞 429 限流，等待 ${SLP}s 后重试（$TRY/$DL_RETRY）" >> "$LOG"
+                sleep "$SLP"
+                continue
+                ;;
+            *)
+                TRY=$((TRY + 1))
+                if [ "$TRY" -gt "$DL_RETRY" ]; then
+                    echo "[$(date '+%m-%d %H:%M:%S')]   下载 $DIP 失败（HTTP ${CODE:-000}）超过 $DL_RETRY 次重试，放弃该次样本" >> "$LOG"
+                    echo ""
+                    return 1
+                fi
+                echo "[$(date '+%m-%d %H:%M:%S')]   下载 $DIP 失败（HTTP ${CODE:-000}），3s 后重试（$TRY/$DL_RETRY）" >> "$LOG"
+                sleep 3
+                continue
+                ;;
+        esac
+        [ -n "$SIZE" ] && echo "$SIZE" >> "$V4DIR/.bytes"
+        awk -v s="$SIZE" -v a="$TTFB" -v b="$TOT" 'BEGIN{d=b-a; if(d<0.2) d=b*0.2; printf "%.0f\n", (b>0 ? s/d : 0)}'
+        return 0
     done
 }
 
@@ -466,18 +497,49 @@ if [ "$PCNT" -eq 0 ]; then
     exit 1
 fi
 
-# ---- 2. HTTPing 延迟测速：429 则退避等待后重扫；非 429 连续失败 3 轮判致命退出 ----
+# ---- 2. HTTPing 延迟测速（两段式）：先 t=1 剔死 IP，再对幸存者做 t=LAT_TRYS 次取平均 ----
+# 【v2】原实现 -t 1 只有单样本；-tl 300 的通过率很高，等于没筛。两段式代约为"全量 4 次"的 1/3。
+#   第一段用放宽上限（SELF_LAT+60）避免单次探测抖动误杀，第二段用严格上限 + -tlr 丢包门槛。
+# -p 0：只是"控制台显示条数"（不是端口探测间隔），0 = 不打印表格，CSV 照常写入。
 # 内存兜底：路由器常驻进程（CrashCore 等）占 ~288MB，cfst 大规模启动时 Go runtime
-# 可能 "out of memory allocating heap arena map" 崩溃；先释放 page cache 腾出物理内存
-sync 2>/dev/null; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+# 可能 "out of memory allocating heap arena map" 崩溃；每轮扫描前先释放 page cache。
+PASS1_LAT=$((SELF_LAT + 60))
 ROUND=0
 CNT=0
 FATAL=0
+OOMHIT=0
 while :; do
     ROUND=$((ROUND + 1))
-    rm -f "$V4DIR/.lat.csv"
-    "$DIR/cfst" -f "$V4DIR/pool.txt" -httping -n "$LAT_THREAD" -t "$LAT_TIMEOUT" -dd -p 10 -url "$LAT_URL" -httping-code 204 -tl "$SELF_LAT" -o "$V4DIR/.lat.csv" > "$V4DIR/cfst_run.log" 2>&1
+    sync 2>/dev/null; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+    rm -f "$V4DIR/.lat.csv" "$V4DIR/.lat1.csv" "$V4DIR/.lat1.ips"
+    # 第一段：粗糙延迟筛（t=1，只为缩小第二段样本量）
+    "$DIR/cfst" -f "$V4DIR/pool.txt" -httping -n "$LAT_THREAD" -t "$LAT_TIMEOUT" -dd -p 0 \
+        -url "$LAT_URL" -httping-code 204 -tl "$PASS1_LAT" -o "$V4DIR/.lat1.csv" \
+        > "$V4DIR/cfst_run.log" 2>&1
     RC=$?
+    # 启动期 OOM：Go runtime 拿不到堆内存时二进制会立刻带栈退出，此时轮转 30 次毫无意义
+    if [ "$RC" -ne 0 ] && grep -q "out of memory" "$V4DIR/cfst_run.log" 2>/dev/null; then
+        OOMHIT=$((OOMHIT + 1))
+        echo "[$(date '+%m-%d %H:%M:%S')]cfst 启动期内存不足（heap arena map），第 $OOMHIT 次；并发 $LAT_THREAD → $OOM_THREAD 后重试" >> "$LOG"
+        [ "$OOMHIT" -ge 2 ] && {
+            echo "[$(date '+%m-%d %H:%M:%S')]内存不足连续 $OOMHIT 次，放弃本轮，$RESULT_FILE 保留上次值" >> "$LOG"
+            tail -30 "$V4DIR/cfst_run.log" >> "$LOG" 2>/dev/null
+            tail -"$LOG_KEEP_LINES" "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"
+            exit 1
+        }
+        LAT_THREAD="$OOM_THREAD"
+        sleep 10
+        continue
+    fi
+    awk -F, 'NR>1 && $1 ~ /^[0-9]+\./ {print $1}' "$V4DIR/.lat1.csv" 2>/dev/null > "$V4DIR/.lat1.ips"
+    P1CNT=$(grep -c . "$V4DIR/.lat1.ips" 2>/dev/null); [ -z "$P1CNT" ] && P1CNT=0
+    # 第二段：幸存者复测（t=LAT_TRYS 次取平均 + 丢包上限 LAT_LOSS）
+    if [ "$RC" -eq 0 ] && [ "$P1CNT" -gt 0 ]; then
+        "$DIR/cfst" -f "$V4DIR/.lat1.ips" -httping -n "$LAT_THREAD" -t "$LAT_TRYS" -dd -p 0 \
+            -url "$LAT_URL" -httping-code 204 -tl "$SELF_LAT" -tlr "$LAT_LOSS" -o "$V4DIR/.lat.csv" \
+            >> "$V4DIR/cfst_run.log" 2>&1
+        RC=$?
+    fi
     CNT=$(awk -F, 'NR>1 && $1 ~ /^[0-9]+\./ {n++} END{print n+0}' "$V4DIR/.lat.csv" 2>/dev/null)
     [ -z "$CNT" ] && CNT=0
     [ $RC -eq 0 ] && [ "$CNT" -gt 0 ] && break
@@ -487,7 +549,7 @@ while :; do
         tail -"$LOG_KEEP_LINES" "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"
         exit 1
     fi
-    echo "[$(date '+%m-%d %H:%M:%S')]第 $ROUND 轮延迟测速无结果（退出码 $RC），探测 429 状态" >> "$LOG"
+    echo "[$(date '+%m-%d %H:%M:%S')]第 $ROUND 轮延迟测速无结果（第一段 $P1CNT 个候选、退出码 $RC），探测 429 状态" >> "$LOG"
     if ! wait_429_clear "$LAT_URL"; then
         echo "[$(date '+%m-%d %H:%M:%S')]429 等待超限，放弃本轮，$RESULT_FILE 保留上次值" >> "$LOG"
         tail -"$LOG_KEEP_LINES" "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"
@@ -502,9 +564,12 @@ while :; do
     fi
     echo "[$(date '+%m-%d %H:%M:%S')]端点未被限流，开始第 $((ROUND + 1)) 轮重扫" >> "$LOG"
 done
-echo "[$(date '+%m-%d %H:%M:%S')]延迟测速完成（第 $ROUND 轮）：$CNT 个候选（<250ms），取前 $DL_TOPN 名进入快筛" >> "$LOG"
+echo "[$(date '+%m-%d %H:%M:%S')]延迟测速完成（第 $ROUND 轮，两段式 t=1→t=$LAT_TRYS、丢包≤$LAT_LOSS）：粗筛幸存 $P1CNT 个 → 精测延迟 $CNT 个候选（<$SELF_LAT ms），取前 $DL_TOPN 名进入快筛" >> "$LOG"
+rm -f "$V4DIR/.lat1.csv" "$V4DIR/.lat1.ips"
+# cfst 进度条用 \r 覆写无换行，两段式会让 cfst_run.log 涨到 ~100KB/轮；只保留最后 20KB
+tail -c 20000 "$V4DIR/cfst_run.log" > "$V4DIR/.c.tmp" 2>/dev/null && mv "$V4DIR/.c.tmp" "$V4DIR/cfst_run.log"
 
-# ---- 3. 下载闸门 + 4a 快筛：每个候选 1 次 x 5MB ----
+# ---- 3. 下载闸门 + 4a 快筛：每个候选 1 次 x 1MB（只做淘汰门槛，不参与定序） ----
 if ! wait_429_clear "$DL_URL" 1; then
     echo "[$(date '+%m-%d %H:%M:%S')]下载源 429 等待超限，放弃本轮，$RESULT_FILE 保留上次值" >> "$LOG"
     tail -"$LOG_KEEP_LINES" "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"
@@ -512,6 +577,7 @@ if ! wait_429_clear "$DL_URL" 1; then
 fi
 FASTTMP="$V4DIR/.fast.tmp"
 : > "$FASTTMP"
+: > "$V4DIR/.bytes"   # 流量计数从快筛开始（含快筛 + 精测 + 重试），轮末统计后删除
 N=0
 # 快筛候选按机场（colo）分组采样（同 v6）：每个机场取延迟最低的 COLO_PICK 个进快筛，
 # 强制每个机场都有代表；不足 DL_TOPN 时按延迟顺位回填；COLO_PICK=0 退化为纯延迟顺位
@@ -534,18 +600,46 @@ for entry in $(cat "$FAST_SEL" 2>/dev/null | grep .); do
     N=$((N + 1))
     ip="${entry%%|*}"; rest="${entry#*|}"; lat="${rest%%|*}"; colo="${rest##*|}"
     S1=$(dl_once "$FAST_URL" "$ip")
-    S1I=$(awk -v v="${S1:-0}" 'BEGIN{printf "%.0f", v+0}')
+    if [ -z "$S1" ]; then
+        echo "[$(date '+%m-%d %H:%M:%S')]   快筛 [$N/$DL_TOPN] $ip：下载失败（延迟 ${lat}ms ${colo}），剔除" >> "$LOG"
+        continue
+    fi
+    S1I=$(awk -v v="$S1" 'BEGIN{printf "%.0f", v+0}')
     MB=$(awk -v v="$S1I" 'BEGIN{printf "%.2f", v/1048576}')
-    NOTE=""
-    [ -z "$S1" ] && NOTE="（429超限跳过，记0）"
-    echo "[$(date '+%m-%d %H:%M:%S')]   快筛 [$N/$DL_TOPN] $ip：${MB} MB/s（延迟 ${lat}ms ${colo}）$NOTE" >> "$LOG"
+    echo "[$(date '+%m-%d %H:%M:%S')]   快筛 [$N/$DL_TOPN] $ip：${MB} MB/s（延迟 ${lat}ms ${colo}）" >> "$LOG"
     # 竖线连接为单个 token（busybox 的 for/命令替换按空白分词，字段内不能有空格）
     echo "$S1I|$lat|$ip|$colo" >> "$FASTTMP"
 done
 rm -f "$V4DIR/.lat.csv" "$FAST_SEL"
-# 快筛排序：速度降序（busybox sort 不支持 -o 和 -k 逗号键，用 -rn + 临时文件写回）
-sort -t"|" -rn "$FASTTMP" 2>/dev/null > "$FASTTMP.s" && mv "$FASTTMP.s" "$FASTTMP"
 FCNT=$(grep -c . "$FASTTMP" 2>/dev/null); [ -z "$FCNT" ] && FCNT=0
+
+# ---- 4a-2. 淘汰赛（同 v6）：快筛只做门槛、不参与定序 ----
+# 规则：低于本轮快筛速度中位数 60% 的剔除；幸存不足 FAST_TOPN 时按速度补足；
+#   幸存者按 PICK_MODE 定序（lat=延迟优先 / speed=速度优先，旧行为）。
+MED=0; FLOOR=0
+if [ "$FCNT" -gt 0 ]; then
+    MED=$(awk -F'|' '{print $1}' "$FASTTMP" | sort -n \
+          | awk '{a[NR]=$1} END{if(NR==0)print 0; else if(NR%2)print a[(NR+1)/2]; else print int((a[NR/2]+a[NR/2+1])/2)}')
+    [ -z "$MED" ] && MED=0
+    FLOOR=$((MED * 6 / 10))
+fi
+awk -F'|' -v f="$FLOOR" '($1 + 0) >= f' "$FASTTMP" 2>/dev/null > "$FASTTMP.pass"
+KCNT=$(grep -c . "$FASTTMP.pass" 2>/dev/null); [ -z "$KCNT" ] && KCNT=0
+if [ "$KCNT" -lt "$FAST_TOPN" ]; then
+    sort -t"|" -rn "$FASTTMP" 2>/dev/null | head -n "$FAST_TOPN" > "$FASTTMP.pass"
+    KCNT=$(grep -c . "$FASTTMP.pass" 2>/dev/null); [ -z "$KCNT" ] && KCNT=0
+fi
+if [ "$PICK_MODE" = "speed" ]; then
+    sort -t"|" -rn "$FASTTMP.pass" 2>/dev/null > "$FASTTMP.s"
+else
+    # 注意：本机 busybox v1.25 的 sort 不支持 -k 键（-k2,2n 静默无效），
+    # 这里把延迟换到第 1 字段，用 sort -n 按整行首个数字排序，再换回来。
+    awk -F'|' '{print $2"|"$1"|"$3"|"$4}' "$FASTTMP.pass" 2>/dev/null \
+        | sort -t"|" -n \
+        | awk -F'|' '{print $2"|"$1"|"$3"|"$4}' > "$FASTTMP.s" 2>/dev/null
+fi
+mv "$FASTTMP.s" "$FASTTMP" 2>/dev/null; rm -f "$FASTTMP.pass"
+echo "[$(date '+%m-%d %H:%M:%S')]快筛淘汰：$FCNT 个有效样本，中位数 $(awk -v v="$MED" 'BEGIN{printf "%.2f", v/1048576}') MB/s，门槛 $(awk -v v="$FLOOR" 'BEGIN{printf "%.2f", v/1048576}') MB/s → 幸存 $KCNT 个，按 ${PICK_MODE} 定序" >> "$LOG"
 
 # ---- 4b. 精测：多样性筛选后前 FAST_TOPN 名每个 DL_RUNS 次 x 9.1MB 取平均 ----
 # 4a-2. 多样性筛选（三级，与 v6 同构，键为 /24 = 前三段）：同一 /24 最多 DIV_SEG_MAX 条、
@@ -577,7 +671,12 @@ END {
 }
 ' "$FASTTMP" > "$FSEL" 2>/dev/null
 FSELC=$(grep -c . "$FSEL" 2>/dev/null); [ -z "$FSELC" ] && FSELC=0
-echo "[$(date '+%m-%d %H:%M:%S')]快筛完成：$FCNT 个候选，多样性筛选（同/24≤$DIV_SEG_MAX、同地区≤$DIV_COLO_MAX）后 $FSELC 个进入精测（${DL_RUNS}次x10MB）" >> "$LOG"
+echo "[$(date '+%m-%d %H:%M:%S')]快筛完成：$FCNT 个候选，多样性筛选（同/24≤$DIV_SEG_MAX、同地区≤$DIV_COLO_MAX）后 $FSELC 个进入精测（${DL_RUNS}次x9.1MB）" >> "$LOG"
+if [ "$FSELC" -eq 0 ]; then
+    echo "[$(date '+%m-%d %H:%M:%S')]无候选进入精测（快筛全失败），放弃本轮，$RESULT_FILE 保留上次值" >> "$LOG"
+    tail -"$LOG_KEEP_LINES" "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"
+    exit 1
+fi
 RANKED="$V4DIR/.ranked.tmp"
 : > "$RANKED"
 M=0
@@ -591,7 +690,7 @@ for entry in $(cat "$FSEL" | grep .); do
         S=$(dl_once "$DL_URL" "$ip")
         if [ -z "$S" ]; then
             [ -n "$FAILNOTE" ] && FAILNOTE="$FAILNOTE "
-            FAILNOTE="${FAILNOTE}样本${RUN}超限跳过"
+            FAILNOTE="${FAILNOTE}样本${RUN}失败跳过"
         else
             SVAL=${S%%.*}
             [ -z "$SVAL" ] && SVAL=0
@@ -602,10 +701,21 @@ for entry in $(cat "$FSEL" | grep .); do
     if [ "$NS" -gt 0 ]; then AVG=$((SUM / NS)); else AVG=0; fi
     MB=$(awk -v v="$AVG" 'BEGIN{printf "%.2f", v/1048576}')
     [ -n "$FAILNOTE" ] && FAILNOTE="（$FAILNOTE）"
+    # 【v2】全样本失败（AVG=0）的候选不写榜
+    if [ "$AVG" -le 0 ]; then
+        echo "[$(date '+%m-%d %H:%M:%S')]   精测 [$M/$FAST_TOPN] $ip：全部样本失败$FAILNOTE，剔除不写榜" >> "$LOG"
+        continue
+    fi
     echo "[$(date '+%m-%d %H:%M:%S')]   精测 [$M/$FAST_TOPN] $ip：${MB} MB/s（延迟 ${lat}ms ${colo}）$FAILNOTE" >> "$LOG"
     echo "$AVG $lat $ip $colo" >> "$RANKED"
 done
 rm -f "$FASTTMP" "$FSEL"
+RCNT0=$(grep -c . "$RANKED" 2>/dev/null); [ -z "$RCNT0" ] && RCNT0=0
+if [ "$RCNT0" -eq 0 ]; then
+    echo "[$(date '+%m-%d %H:%M:%S')]精测无任何有效结果，放弃本轮，$RESULT_FILE 保留上次值" >> "$LOG"
+    tail -"$LOG_KEEP_LINES" "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"
+    exit 1
+fi
 
 # ---- 5. 排序（速度降序）→ TopN → 结果文件（$RESULT_FILE）+ 归档 ----
 sort -rn "$RANKED" 2>/dev/null > "$RANKED.s" && mv "$RANKED.s" "$RANKED"
@@ -643,7 +753,11 @@ awk -v m="$BESTMB" -v sp="$SPEED_PASS" 'BEGIN{exit !(m+0 >= sp)}' && NOTE="（�
 DUR=$(( $(date +%s) - START_TS ))
 # 上榜机场分布（观测多样性是否生效）：如 "LAX×3 SEA×3 LHR×3 PDX×1 "
 COLO_DIST=$(grep -v '^#' "$V4DIR/$RESULT_FILE" 2>/dev/null | grep -oE '\-[A-Z]{3}$' | sort | uniq -c | awk '{printf "%s×%s ", substr($2,2), $1}')
-echo "[$(date '+%m-%d %H:%M:%S')]测速完成（耗时 ${DUR}s）：最优 $BESTIP（${BESTCOLO} 延迟 ${BESTLAT}ms 实测 ${BESTMB}MB/s）$NOTE，候选 $CNT 个，快筛 $N 个，精测 $M 个，上榜 $RANKCNT 个，机场分布 ${COLO_DIST}" >> "$LOG"
+# 本轮下载流量（快筛+精测实际消耗，用于观察每轮成本）
+DLMB=$(awk '{s+=$1} END{printf "%.0f", s/1048576}' "$V4DIR/.bytes" 2>/dev/null)
+[ -z "$DLMB" ] && DLMB=0
+rm -f "$V4DIR/.bytes"
+echo "[$(date '+%m-%d %H:%M:%S')]测速完成（耗时 ${DUR}s）：最优 $BESTIP（${BESTCOLO} 延迟 ${BESTLAT}ms 实测 ${BESTMB}MB/s）$NOTE，粗筛幸存 $P1CNT 个，延迟候选 $CNT 个，快筛 $N 个，精测 $M 个，上榜 $RANKCNT 个，下载流量 ${DLMB}MB，机场分布 ${COLO_DIST}" >> "$LOG"
 
 # ---- 6. 日志瘦身 ----
 tail -"$LOG_KEEP_LINES" "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"

@@ -38,20 +38,35 @@ GH_CONNECT_TIMEOUT="${GH_CONNECT_TIMEOUT:-6}"
 GH_MAXTIME="${GH_MAXTIME:-25}"
 GH_PURGE_TIMEOUT="${GH_PURGE_TIMEOUT:-15}"
 STATUS_FILE="${STATUS_FILE:-status.txt}"
+GH_RETRY="${GH_RETRY:-3}"
 GH_RESP="$DIR/.gh_resp"
 
-# GitHub API 请求封装：直连 → 失败走代理，各试一次
+# GitHub API 请求封装：直连 → 代理 为一个回合，整回合失败（传输错误 / 5xx / 429）再重试，
+# 最多 GH_RETRY 个回合（默认 3），回合间隔 3 秒。
+# 【v2】老实现只在"传输失败/000"时换代理，HTTP 5xx 直接判失败：
+#   11-04 18:11 就因 GitHub 返回一次 502 丢掉整轮榜单（手动重跑同样的请求即 200）。
 # 用法：gh_req <curl 参数...>；副作用全局变量：GH_CODE=HTTP码，GH_VIA=direct|proxy，响应体在 $GH_RESP
 gh_req() {
-    for GH_VIA in direct proxy; do
-        if [ "$GH_VIA" = "proxy" ]; then
-            PX="-x http://127.0.0.1:$PROXY_PORT"
-        else
-            PX=""
-        fi
-        GH_CODE=$(curl -sk $PX --connect-timeout "$GH_CONNECT_TIMEOUT" --max-time "$GH_MAXTIME" -H "Authorization: Bearer $GH_TOKEN" \
-                  -o "$GH_RESP" -w '%{http_code}' "$@" 2>/dev/null)
-        [ "$?" -eq 0 ] && [ "$GH_CODE" != "000" ] && return 0
+    GH_ATTEMPT=0
+    while [ "$GH_ATTEMPT" -lt "$GH_RETRY" ]; do
+        GH_ATTEMPT=$((GH_ATTEMPT + 1))
+        for GH_VIA in direct proxy; do
+            if [ "$GH_VIA" = "proxy" ]; then
+                PX="-x http://127.0.0.1:$PROXY_PORT"
+            else
+                PX=""
+            fi
+            GH_CODE=$(curl -sk $PX --connect-timeout "$GH_CONNECT_TIMEOUT" --max-time "$GH_MAXTIME" -H "Authorization: Bearer $GH_TOKEN" \
+                      -o "$GH_RESP" -w '%{http_code}' "$@" 2>/dev/null)
+            RC=$?
+            [ "$RC" -eq 0 ] && [ "$GH_CODE" != "000" ] || continue
+            case "$GH_CODE" in
+                500|502|503|504|429) ;;   # 临时性错误：换通道/下一回合重试
+                *) return 0 ;;
+            esac
+        done
+        echo "[$(date '+%m-%d %H:%M:%S')]GH 请求临时失败（HTTP ${GH_CODE:-000}），第 $GH_ATTEMPT/$GH_RETRY 回合，3s 后重试" >> "$LOG"
+        sleep 3
     done
     return 1
 }
