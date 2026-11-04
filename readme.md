@@ -1,6 +1,6 @@
 # CloudflareSpeedTest 优选系统 · 完整流程与逻辑说明
 
-> 适用版本：2026-11-03 晚（含前缀级学习+短期记忆 / 三级多样性筛选 / 快筛按机场分组采样 / 机场分布观测 / 全参数配置化 / 48 线程 / 1MB 快筛 / status.txt）
+> 适用版本：2026-11-04（含前缀级学习滑动窗口 / 随机段探索去重 / 短期记忆 / 三级多样性筛选 / 快筛按机场分组采样 / 机场分布观测 / 全参数配置化 / 48 线程 / 1MB 快筛 / status.txt）
 > 部署位置：路由器 `/data/cfst/`（OpenWrt / busybox 1.25.1）
 > 文件清单：`run.sh`（总调度）· `run_v6.sh` · `run_v4.sh` · `githubpush.sh` · `config.txt` · `V6url.txt` · `V4url.txt` · `cfst`（XIU2 二进制）
 
@@ -17,9 +17,9 @@ cron（17 0,6-23 * * *，系统 crontab 写死，不在 config.txt）
         ├→ timeout -t V4_TIMEUP sh run_v4.sh   → RC_V4
         └→ sh githubpush.sh $RC_V6 $RC_V4
              ├→ GH_UPLOAD_ENABLE=0 → 整体跳过
-             ├→ 上传 best_ip_v6.txt（RC=0 且文件非空才传）
-             ├→ 上传 best_ip_v4.txt
-             └→ 上传 status.txt（每轮覆盖，健康状态一览）
+             ├→ 上传 $V6_RESULT_FILE（RC=0 且文件非空才传）
+             ├→ 上传 $V4_RESULT_FILE
+             └→ 上传 $STATUS_FILE（每轮覆盖，健康状态一览）
 ```
 
 三个顶级开关（config.txt 最上面）：`GH_UPLOAD_ENABLE` / `V6_ENABLE` / `V4_ENABLE`。
@@ -60,11 +60,12 @@ cron（17 0,6-23 * * *，系统 crontab 写死，不在 config.txt）
 - 随机生成下 IP 不会跨轮重复，旧的"精确 IP 计数 ≥SELF_MIN"永远为 0，已废弃；改为"上轮赢家直接回测"保连续性。
 - 配置项：`V6_SELF_LAT=250`（SELF_MIN 已转用于 1b-1 学习段阈值）。
 
-### 1b-1. 前缀级段学习
-- 遍历**所有** `history/best_*.txt`，每个 IP 归到 /48（v6）/ /24（v4）前缀并计数；
+### 1b-1. 前缀级段学习（滑动窗口）
+- 遍历**最近 `LEARN_WINDOW` 份** `history/best_*.txt`（`ls -t` 时间倒序取前 N），每个 IP 归到 /48（v6）/ /24（v4）前缀并计数；
   累计上榜**轮次**（同一段一轮最多计 1 次，防单轮刷满污染）≥ `SELF_MIN` 的段 → 优质段，按轮次降序取 `LEARN_MAX`。
+- 滑动窗口的意义：只认最近约 1 天（24 份）的好段，过时段自动滑出学习池、紧跟 CF 优选变化——避免历史累计次数把已过时段"软固化"在池里；`LEARN_WINDOW=0` 退回统计全部历史（旧行为）。
 - 段可跨轮重复命中，是唯一稳定的学习单位；v6 用前 3 组 key 包含匹配（兼容 /52 /56 /64），v4 用 `x.y.z.0/24` 全字匹配。
-- 配置项：`V6_SELF_MIN=2`、`V6_LEARN_MAX=8`。
+- 配置项：`V6_SELF_MIN=2`、`V6_LEARN_MAX=8`、`V6_LEARN_WINDOW=24`。
 
 ### 1b-1s. 短期记忆（冷启动加速）
 - 上轮 best 上榜 IP 的前缀（v6 /48、v4 /24）直接并入学习段，让上轮赢家下轮立刻复用，不等跨轮计数。
@@ -84,10 +85,11 @@ cron（17 0,6-23 * * *，系统 crontab 写死，不在 config.txt）
 - **超过 `LEARN_MAX` 条 → 只取前 N 条**（防历史好段挤占探索名额）。
 - 配置项：`V6_LEARN_MAX=8`。
 
-### 1d. 随机抽段
+### 1d. 随机抽段（含探索去重）
 - 名额 = `SEG_PICK - LEARNED`；**≤0 → 跳过本轮抽段**。
-- 排除已学习段后，随机抽样（urandom→md5 前 8 位 hex→h2d 做 srand 种子；busybox srand 大数截断坑的规避方案）。
-- 配置项：`V6_SEG_PICK=20`；写死：`head -c 8 /dev/urandom`、种子兜底值 `1a2b3c4d`。
+- 排除已学习段后，再**排除最近 `AVOID_KEEP` 条已探索段**（`.seg.avoid` 滑动窗口记录），随机抽样（urandom→md5 前 8 位 hex→h2d 做 srand 种子；busybox srand 大数截断坑的规避方案）。
+- 探索去重：每轮抽中的随机段追加进 `.seg.avoid` 并 `tail -n $AVOID_KEEP` 裁剪，避免连续几轮重复探索同一批段、扩大覆盖；若排除后剩余不足名额则**回退到仅排除学习段**（允许重抽保量）；`AVOID_KEEP=0` 关闭去重。
+- 配置项：`V6_SEG_PICK=20`、`V6_AVOID_KEEP=48`；写死：`head -c 8 /dev/urandom`、种子兜底值 `1a2b3c4d`。
 
 ### 1d-2. 段展开（脚本自生成随机 IP，替代 cfst 随机游走）
 - 学习段+随机段（均已归一化为 /48 或更细）每条生成 `IPS_PER_SEG` 个段内随机 IPv6：
@@ -135,14 +137,14 @@ cron（17 0,6-23 * * *，系统 crontab 写死，不在 config.txt）
 - 配置项：`V6_FAST_TOPN=10`、`V6_DIV_SEG_MAX=2`、`V6_DIV_COLO_MAX=3`。
 
 ### 4b. 精测
-- 入选名单逐个下载 `DL_URL`（9.1MB）2 次取平均；429 处理同快筛。
-- 配置项：`V6_DL_URL`、`V6_DL_MAXTIME`、`V6_DL_RETRY`。
+- 入选名单逐个下载 `DL_URL`（9.1MB）`DL_RUNS` 次取平均；429 处理同快筛。
+- 配置项：`V6_DL_URL`、`V6_DL_MAXTIME`、`V6_DL_RETRY`、`V6_DL_RUNS=1`。
 
 ### 5. 排序输出 + 归档
-- 精测速度降序取前 `TOPN` → `v6/best_ip_v6.txt`；首行 `# updated: 时间戳`，行格式 `[ip]:443#ip-443-延迟ms-速度MB/s-地区`。
+- 精测速度降序取前 `TOPN` → `v6/$RESULT_FILE`（文件名由 config 的 `V6_RESULT_FILE` 决定，如 `best_ip_v6_yidong.txt`）；首行 `# updated: 时间戳`，行格式 `[ip]:443#ip-443-延迟ms-速度MB/s-地区`。
 - 归档 `history/best_时间戳.txt`，**超过 `KEEP` 份删最旧**。
-- 日志记完成行（最优 IP/延迟/速度/候选数/上榜数；速度 ≥8MB/s 附加"达标"标注——8 这个标准写死）。
-- 配置项：`V6_TOPN=10`、`V6_KEEP=48`；写死：8MB/s 达标线、日志瘦身 500 行。
+- 日志记完成行（最优 IP/延迟/速度/候选数/上榜数；速度 ≥`SPEED_PASS` 附加"达标"标注）。
+- 配置项：`V6_TOPN=10`、`V6_KEEP=48`、`V6_SPEED_PASS=8`、`LOG_KEEP_LINES=500`。
 
 ---
 
@@ -173,7 +175,7 @@ cron（17 0,6-23 * * *，系统 crontab 写死，不在 config.txt）
    - GET 取现有文件 sha → PUT Contents API；
    - **双通道**：直连 api.github.com 失败（网络层）→ 自动改走 `http://127.0.0.1:GH_PROXY_PORT` 重试一次；
    - 成功后 purge `purge.jsdelivr.net`（响应含 `"status": "finished"` 判定成功）。
-4. **status.txt**（每轮必传，不去重）：两栈最后一条关键日志（测速完成/放弃原因，含**机场分布**）+ 退出码 + 本轮上传结果 → 仓库 `status.txt`，打开 raw 链接即可知道系统健康状态和多样性是否生效。
+4. **status 文件**（每轮必传，不去重，文件名 = `$STATUS_FILE`）：两栈最后一条关键日志（测速完成/放弃原因，含**机场分布**）+ 退出码 + 本轮上传结果 → 仓库，打开 raw 链接即可知道系统健康状态和多样性是否生效。
 
 ---
 
@@ -195,7 +197,9 @@ cron（17 0,6-23 * * *，系统 crontab 写死，不在 config.txt）
 | 结果筛选 | DIV_SEG_MAX | 2 | 2 | 同 /48(v6)//24(v4) 上榜上限 |
 | 结果筛选 | DIV_COLO_MAX | 3 | 3 | 同地区上榜上限 |
 | 池构建 | SEG_PICK | 20 | 20 | 每轮入池段总数 |
+| 池构建 | AVOID_KEEP | 48 | 48 | 随机段探索去重窗口（避开最近抽中条数，0=关闭） |
 | 池构建 | LEARN_MAX | 8 | 8 | 学习段封顶 |
+| 池构建 | LEARN_WINDOW | 24 | 24 | 学习段滑动窗口（只统计最近份数，0=不限） |
 | 池构建 | IPS_PER_SEG | 200 | 200 | 每段展开随机 IP 数（0=关闭） |
 | 池构建 | TGT_PER_IP | 25 | （无） | 好 IP /64 邻域定向数（v4 无此项） |
 | 池构建 | TGT_MAX_PREFIX | 16 | （无） | 定向 /64 前缀数量上限（v4 无此项） |
@@ -211,6 +215,7 @@ cron（17 0,6-23 * * *，系统 crontab 写死，不在 config.txt）
 | 测速参数 | LAT_TIMEOUT | 1 | 1 | 延迟测速单 IP 超时(秒) |
 | 测速参数 | DL_MAXTIME | 10 | 10 | 单次下载限时(秒) |
 | 测速参数 | DL_RETRY | 3 | 3 | 下载 429 重试上限 |
+| 测速参数 | DL_RUNS | 1 | 1 | 精测每候选下载次数（取平均，1 省流量） |
 | 测速参数 | SPEED_PASS | 8 | 8 | 达标速度阈值 MB/s（仅日志标注） |
 | 测速目标 | LAT_URL | cp.cloudflare.com/generate_204 | 同 | 勿用 www.cloudflare.com（WAF） |
 | 测速目标 | FAST_URL | cdnjs echarts 1MB | 同 | 快筛源（只做粗排，1MB 省 2/3 流量） |
@@ -230,7 +235,7 @@ cron（17 0,6-23 * * *，系统 crontab 写死，不在 config.txt）
 | 随机种子 | `head -c 8 /dev/urandom \| md5sum \| cut -c1-8`，兜底值 `1a2b3c4d` / `9f8e7d6c` / `4d3c2b1a` |
 | 回退下载源 | `speed.cloudflare.com/__down`（5MB/10MB，预检失败时官方兜底） |
 | 展开细节 | v6 保留前 `掩码/4` 位 hex；v4 /24 避开 .0/.255、粗段全段随机 |
-| 测量次数 | 快筛每候选 1 次、精测每候选 2 次取平均（方法论，改需同步脚本循环） |
+| 测量次数 | 快筛每候选 1 次、精测每候选 `DL_RUNS` 次取平均（已配置化，默认 1） |
 | busybox 适配 | `timeout -t`（GNU 语法会 127 假跑！）、sort 无 -o/-k1,1n、无 od/cksum、scp 不可用（cat 管道）、srand 大数截断 |
 | cfst 机制 | 一条 v4 段只产 1 个随机 IP；v6 游走每条 /48 ≈ 数百个且偏向段头（现已被脚本展开替代） |
 
@@ -243,8 +248,8 @@ V6url.txt ──分流──> .seg.all(段) / .ips.all(纯IP)
                         │ 1a-2 归一化(/48)
                         ▼
 history/ ──上轮best──> .p3 自建池(复测+定向)
-       └─前缀计数≥SELF_MIN─> .seg.learn(学习段) ─┐
-                  │ 1b-2        │ 1c key匹配           │1d 随机抽段
+       └─前缀计数(窗口)≥SELF_MIN─> .seg.learn(学习段) ─┐
+                  │ 1b-2        │ 1c key匹配           │1d 随机抽段(避已探索)
                   ▼             ▼                      ▼
               .p3.tgt      (key命中段)            .seg.pick
                   └───────┬──────┴──────────┬──────────┘
@@ -255,7 +260,7 @@ history/ ──上轮best──> .p3 自建池(复测+定向)
                           ▼
               快筛(前DL_TOPN, 1MB) → 三级多样性筛选 → 精测(前FAST_TOPN, 9.1MB x2)
                           ▼
-              best_ip_v6.txt (TopN) + history/ 归档
+              $RESULT_FILE (TopN) + history/ 归档
                           ▼ (run.sh 统一调度)
-              githubpush.sh → best_ip_v6/v4.txt + status.txt → GitHub/jsDelivr
+              githubpush.sh → $V6/V4_RESULT_FILE + $STATUS_FILE → GitHub/jsDelivr
 ```
