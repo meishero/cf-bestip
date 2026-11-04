@@ -70,23 +70,23 @@ STATUS_FILE=""
 # ---- 结果与筛选 ----
 
 # 最终排名保留名次（结果文件与 GitHub 榜单条数）
-V6_TOPN=10
+V6_TOPN=15
 # 结果文件名（本地生成 + GitHub 同名上传）：移植到不同宽带运营商的路由器时，只改这里即可整套复用——
 # 移动宽带用 best_ip_v6_yidong.txt、电信改 best_ip_v6_dianxin.txt；多台路由器可共用一个 GitHub 仓库互不覆盖
 V6_RESULT_FILE=""
 # 延迟测速后进入快筛的名次
-V6_DL_TOPN=30
+V6_DL_TOPN=45
 # 快筛后进入精测的名次（建议与 V6_TOPN 对齐）
-V6_FAST_TOPN=10
+V6_FAST_TOPN=15
 # 上榜多样性：同一 /48 段最多上榜条数（防止榜单被单一 /48 包揽、段故障时全军覆没；不足时按速度顺位回填）
 V6_DIV_SEG_MAX=2
 # 上榜多样性：同地区（机场码，如 HKG/LAX/MAA）最多上榜条数（不足时按速度顺位回填）
-V6_DIV_COLO_MAX=3
+V6_DIV_COLO_MAX=7
 # 快筛候选抽取（按机场分组采样）：从全部延迟候选里，每个机场（colo）取延迟最低的
 # COLO_PICK 个进快筛，强制每个机场都有代表（防单一机场延迟优势霸榜，实测曾出现
 # 30 个快筛候选 100% 同机场）；不足 DL_TOPN 时按延迟顺位回填。
 # 0 = 关闭分组采样，退回纯延迟顺位（"延迟最优优先"模式，会牺牲机场多样性）
-V6_COLO_PICK=3
+V6_COLO_PICK=5
 
 # ---- 池构建 ----
 
@@ -182,20 +182,20 @@ V6_DL_URL="https://testingcf.jsdelivr.net/npm/typescript@5.4.5/lib/typescript.js
 # ---- 结果与筛选 ----
 
 # 最终排名保留名次（结果文件与 GitHub 榜单条数）
-V4_TOPN=10
+V4_TOPN=15
 # 结果文件名（本地生成 + GitHub 同名上传）：同 v6 语义，移动 best_ip_v4_yidong.txt、电信 best_ip_v4_dianxin.txt
 V4_RESULT_FILE=""
 # 延迟测速后进入快筛的名次
-V4_DL_TOPN=30
+V4_DL_TOPN=45
 # 快筛后进入精测的名次（建议与 V4_TOPN 对齐）
-V4_FAST_TOPN=10
+V4_FAST_TOPN=15
 # 上榜多样性：同一 /24 段最多上榜条数（同 v6 语义，不足时按速度顺位回填）
 V4_DIV_SEG_MAX=2
 # 上榜多样性：同地区（机场码）最多上榜条数（不足时按速度顺位回填）
-V4_DIV_COLO_MAX=3
+V4_DIV_COLO_MAX=7
 # 快筛候选抽取（按机场分组采样，同 v6）：每个机场取延迟最低的 COLO_PICK 个进快筛，
 # 强制每个机场都有代表；不足 DL_TOPN 时按延迟顺位回填；0 = 关闭退回纯延迟顺位
-V4_COLO_PICK=3
+V4_COLO_PICK=5
 
 # ---- 池构建 ----
 
