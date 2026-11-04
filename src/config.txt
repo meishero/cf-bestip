@@ -31,6 +31,8 @@ V4_ENABLE=1
 SRC_CONNECT_TIMEOUT=8
 # 段源拉取：单个源整体超时（秒，覆盖连接 + 下载段列表全程）
 SRC_FETCH_TIMEOUT=30
+# 段源拉取：单个源失败后的重试次数（临时抖动重试 1~2 次多能恢复；总共尝试 1+SRC_RETRY 次，间隔 2 秒）
+SRC_RETRY=2
 # 下载源预检：HEAD 请求超时（秒，测速前探测快筛/精测源是否可用）
 PRECHECK_TIMEOUT=12
 # 429 探测：单次探测超时（秒，撞 429 时探询是否已解除）

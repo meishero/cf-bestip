@@ -81,6 +81,7 @@ TGT_PER_IP="${V4_TGT_PER_IP:-25}"; [ -z "$TGT_PER_IP" ] && TGT_PER_IP=25
 SPEED_PASS="$V4_SPEED_PASS"; [ -z "$SPEED_PASS" ] && SPEED_PASS=8
 SRC_CONNECT_TIMEOUT="${SRC_CONNECT_TIMEOUT:-8}"
 SRC_FETCH_TIMEOUT="${SRC_FETCH_TIMEOUT:-30}"
+SRC_RETRY="${SRC_RETRY:-2}"
 PRECHECK_TIMEOUT="${PRECHECK_TIMEOUT:-12}"
 PROBE_TIMEOUT="${PROBE_TIMEOUT:-15}"
 DL_CONNECT_TIMEOUT="${DL_CONNECT_TIMEOUT:-5}"
@@ -176,27 +177,37 @@ dl_once() {
 echo "[$(date '+%m-%d %H:%M:%S')]===== 开始 IPv4 测速（/24 段级学习/两阶段下载/Top10） =====" >> "$LOG"
 
 # ---- 1. 构建测速池 pool.txt = 自建池 + 学习段 + 随机段 ----
-SEGCNT=0; PICKED=0; LEARNED=0; SCNT=0
+SEGCNT=0; PICKED=0; LEARNED=0; SCNT=0; LOCALCNT=0
 # 1a. 段源处理：按 $DIR/V4url.txt 逐行处理（# 与空行忽略），支持两类行：
 #     - 本地直写：CIDR 段（如 172.64.229.0/24）直接进段池；纯 IPv4 行直接进外部 IP 池
 #     - 订阅地址（http/https）：curl 拉取后逐行自动分流：CIDR 段 → 段池；纯 IPv4 行 → 外部 IP 池
 #     某个源失败/为空自动跳过；全部失败时仅剩自建池兜底
-: > "$V4DIR/.seg.all"; : > "$V4DIR/.ips.all"
+: > "$V4DIR/.seg.all"; : > "$V4DIR/.seg.local"; : > "$V4DIR/.ips.all"; rm -f "$V4DIR/.fetch.ok"
 if [ -f "$DIR/V4url.txt" ]; then
     grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$DIR/V4url.txt" | while read SU; do
         [ -n "$SU" ] || continue
         # 本地直写行：CIDR 段 / 纯 IP 直接入池（不走网络，不受源拉取失败影响）
         if echo "$SU" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]+$'; then
-            echo "$SU" >> "$V4DIR/.seg.all"
+            echo "$SU" >> "$V4DIR/.seg.local"
             continue
         fi
         if echo "$SU" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
             echo "$SU" >> "$V4DIR/.ips.all"
             continue
         fi
-        # 订阅地址：拉取后逐行分流
-        curl -s -k --connect-timeout "$SRC_CONNECT_TIMEOUT" --max-time "$SRC_FETCH_TIMEOUT" "$SU" > "$V4DIR/.fetch.raw" 2>/dev/null
-        [ -s "$V4DIR/.fetch.raw" ] || continue
+        # 订阅地址：拉取（失败重试 SRC_RETRY 次，仍失败记日志跳过）
+        r=0
+        while [ "$r" -le "$SRC_RETRY" ]; do
+            curl -s -k --connect-timeout "$SRC_CONNECT_TIMEOUT" --max-time "$SRC_FETCH_TIMEOUT" "$SU" > "$V4DIR/.fetch.raw" 2>/dev/null
+            [ -s "$V4DIR/.fetch.raw" ] && break
+            r=$((r + 1))
+            [ "$r" -le "$SRC_RETRY" ] && sleep 2
+        done
+        if [ ! -s "$V4DIR/.fetch.raw" ]; then
+            echo "[$(date '+%m-%d %H:%M:%S')]  订阅源拉取失败（重试 $SRC_RETRY 次后仍空）：$SU" >> "$LOG"
+            continue
+        fi
+        touch "$V4DIR/.fetch.ok"
         # 段通道：CIDR 行
         grep -E '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]+$' "$V4DIR/.fetch.raw" >> "$V4DIR/.seg.all" 2>/dev/null
         # IP 通道：纯 IPv4 行
@@ -226,6 +237,31 @@ if [ -s "$V4DIR/.seg.all" ]; then
     mv "$V4DIR/.seg.norm" "$V4DIR/.seg.all" 2>/dev/null
     sort -u "$V4DIR/.seg.all" > "$V4DIR/.seg.all.u" && mv "$V4DIR/.seg.all.u" "$V4DIR/.seg.all"
     [ "$SKIPN" -gt 0 ] && echo "[$(date '+%m-%d %H:%M:%S')]  归一化：$SKIPN 条粗于 /20 的段（如 /16 /13）展开量过大已跳过" >> "$LOG"
+fi
+# 1a-2b. 本地优选段归一化（手写 CIDR 段 = 人工优选段，与订阅段同规则归一化）
+#        归一化后单独展开、确定性进池（不参与随机抽段）
+if [ -s "$V4DIR/.seg.local" ]; then
+    awk -F'/' '
+    {
+        plen = $2 + 0; addr = $1
+        if (plen >= 24) { print addr "/" plen; next }
+        if (plen < 20) { next }
+        split(addr, o, ".")
+        q = 2 ^ (24 - plen)
+        s3 = int(o[3] / q) * q
+        for (k = 0; k < q; k++) printf "%s.%s.%d.0/24\n", o[1], o[2], s3 + k
+    }' "$V4DIR/.seg.local" 2>/dev/null | sort -u > "$V4DIR/.seg.local.norm"
+    LOCALCNT=$(grep -c . "$V4DIR/.seg.local.norm" 2>/dev/null); [ -z "$LOCALCNT" ] && LOCALCNT=0
+    [ "$LOCALCNT" -gt 0 ] && echo "[$(date '+%m-%d %H:%M:%S')]  本地优选段：$LOCALCNT 段（确定性进池）" >> "$LOG"
+fi
+# 1a-3. 段源缓存兜底：订阅源全部失败时，用上次成功拉取的缓存兜底，保持探索面稳定
+#       （订阅源成功则更新缓存 .seg.cache；失败且缓存存在则合并缓存段入池）
+if [ -f "$V4DIR/.fetch.ok" ]; then
+    cp "$V4DIR/.seg.all" "$V4DIR/.seg.cache" 2>/dev/null
+elif [ -s "$V4DIR/.seg.cache" ]; then
+    cat "$V4DIR/.seg.all" "$V4DIR/.seg.cache" 2>/dev/null | sort -u > "$V4DIR/.seg.all.u"
+    mv "$V4DIR/.seg.all.u" "$V4DIR/.seg.all"
+    echo "[$(date '+%m-%d %H:%M:%S')]  订阅源拉取失败，已用段源缓存兜底（缓存段并入池）" >> "$LOG"
 fi
 [ -s "$V4DIR/.seg.all" ] && SEGCNT=$(grep -c . "$V4DIR/.seg.all")
 # 1b. 自建池：最近一轮 best 的上榜 IP（延迟<SELF_LAT）直接复测。
@@ -336,7 +372,7 @@ fi
 #       IPS_PER_SEG 个段内随机 IP（urandom 真随机种子、段内去重、避开 .0/.255），
 #       让每条段贡献多个候选；粗于 /24 的段（正常已被归一化展开，此处兜底）在全段范围随机
 EXPCNT=0
-cat "$V4DIR/.seg.keep" "$V4DIR/.seg.pick" 2>/dev/null \
+cat "$V4DIR/.seg.keep" "$V4DIR/.seg.pick" "$V4DIR/.seg.local.norm" 2>/dev/null \
     | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]+$' | sort -u > "$V4DIR/.seg.exp.in"
 if [ "$IPS_PER_SEG" -gt 0 ] && [ -s "$V4DIR/.seg.exp.in" ]; then
     RSEED2=$(head -c 8 /dev/urandom 2>/dev/null | md5sum 2>/dev/null | cut -c1-8)
@@ -385,8 +421,8 @@ cat "$V4DIR/.seg.exp" "$V4DIR/.learn.ips" "$V4DIR/.p3" "$V4DIR/.ips.pick" 2>/dev
     | sort -u > "$V4DIR/pool.txt"
 PCNT=$(grep -c . "$V4DIR/pool.txt" 2>/dev/null)
 [ -z "$PCNT" ] && PCNT=0
-echo "[$(date '+%m-%d %H:%M:%S')]池构建：细分段源 $SEGCNT 段（学习段 $LEARNED + 随机段 $PICKED = $SEGTOTAL）→ 展开 $EXPCNT 个段内随机 IP + 学习复测 $LIPCNT 个 + 自建池 $SCNT 条 + 外部IP $IPCNT 条 → pool.txt 共 $PCNT 行" >> "$LOG"
-rm -f "$V4DIR/.seg.all" "$V4DIR/.seg.learn" "$V4DIR/.seg.keep" "$V4DIR/.seg.rest" "$V4DIR/.seg.rest0" "$V4DIR/.seg.pick" "$V4DIR/.seg.exp.in" "$V4DIR/.seg.exp" "$V4DIR/.learn.ips" "$V4DIR/.p3" "$V4DIR/.ips.all" "$V4DIR/.ips.pick"
+echo "[$(date '+%m-%d %H:%M:%S')]池构建：细分段源 $SEGCNT 段（学习段 $LEARNED + 随机段 $PICKED = $SEGTOTAL）+ 本地优选段 $LOCALCNT 段 → 展开 $EXPCNT 个段内随机 IP + 学习复测 $LIPCNT 个 + 自建池 $SCNT 条 + 外部IP $IPCNT 条 → pool.txt 共 $PCNT 行" >> "$LOG"
+rm -f "$V4DIR/.seg.all" "$V4DIR/.seg.local" "$V4DIR/.seg.local.norm" "$V4DIR/.seg.learn" "$V4DIR/.seg.keep" "$V4DIR/.seg.rest" "$V4DIR/.seg.rest0" "$V4DIR/.seg.pick" "$V4DIR/.seg.exp.in" "$V4DIR/.seg.exp" "$V4DIR/.learn.ips" "$V4DIR/.p3" "$V4DIR/.ips.all" "$V4DIR/.ips.pick"
 
 if [ "$PCNT" -eq 0 ]; then
     echo "[$(date '+%m-%d %H:%M:%S')]池为空（细分段源失效且无历史），本轮退出，$RESULT_FILE 保留上次值" >> "$LOG"

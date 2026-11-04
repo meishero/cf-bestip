@@ -1,6 +1,6 @@
 # CloudflareSpeedTest 优选系统 · 完整流程与逻辑说明
 
-> 适用版本：2026-11-04（含前缀级学习滑动窗口 / 随机段探索去重 / 短期记忆 / 三级多样性筛选 / 快筛按机场分组采样 / 机场分布观测 / 全参数配置化 / 48 线程 / 1MB 快筛 / status.txt）
+> 适用版本：2026-11-04（含前缀级学习滑动窗口 / 随机段探索去重 / 段源缓存兜底+失败重试 / 本地优选段确定性进池 / 短期记忆 / 三级多样性筛选 / 快筛按机场分组采样 / 机场分布观测 / 全参数配置化 / 48 线程 / 1MB 快筛 / status.txt）
 > 部署位置：路由器 `/data/cfst/`（OpenWrt / busybox 1.25.1）
 > 文件清单：`run.sh`（总调度）· `run_v6.sh` · `run_v4.sh` · `githubpush.sh` · `config.txt` · `V6url.txt` · `V4url.txt` · `cfst`（XIU2 二进制）
 
@@ -42,10 +42,11 @@ cron（17 0,6-23 * * *，系统 crontab 写死，不在 config.txt）
 ### 1a. 段源拉取与逐行分流（V6url.txt）
 每行按顺序判定，**命中即停**：
 1. `#` 开头 / 空行 → 忽略
-2. v6 CIDR（`hex:/数字`）→ 直入段池 `.seg.all`（不走网络）
+2. v6 CIDR（`hex:/数字`）→ 直入**本地优选段** `.seg.local`（手写段 = 人工优选，归一化后直接展开进池、**确定性每轮测**，不参与随机抽段）
 3. 纯 IPv6（含 `:` 的 hex 串，排除纯冒号）→ 直入外部 IP 池 `.ips.all`
-4. 其余当订阅 URL → `curl`（8s 连接 / 30s 上限）拉取后，拉来的内容再走 2/3 的正则分流；**失败/为空静默跳过**
-- 写死：curl 超时、正则；配置项：无（源列表本身在 V6url.txt）。
+4. 其余当订阅 URL → `curl`（8s 连接 / 30s 上限）拉取，**失败重试 `SRC_RETRY` 次**，仍失败记日志跳过；拉来的内容再走 2/3 的正则分流。
+- 段源缓存兜底：订阅源全部失败时，自动用上次成功拉取的缓存 `.seg.cache` 并入池（探索面不骤降）；订阅源成功则刷新缓存。
+- 写死：curl 超时、正则、重试间隔 2s；配置项：`SRC_RETRY=2`（源列表本身在 V6url.txt）。
 
 ### 1a-2. 段归一化（基准 /48）
 | 段掩码 | 分支 |
@@ -54,6 +55,11 @@ cron（17 0,6-23 * * *，系统 crontab 写死，不在 config.txt）
 | /44~/47 | 展开为对齐的 /48 行（最多 16 条），参与后续去重/学习匹配 |
 | < /44（/40 /36 /32…） | **跳过**，计数进日志 |
 - 写死：/48 基准、/44 下限、16 条展开上限。
+
+### 1a-2b. 本地优选段归一化 + 确定性进池
+- 手写 CIDR 段（`.seg.local`）按与订阅段**相同的归一化规则**处理（v6 /48 基准、v4 /24 基准）。
+- 归一化后直接展开 `IPS_PER_SEG` 个段内随机 IP，**确定性全进 pool.txt**（不参与随机抽段，也不受 `IP_PICK` 外部 IP 抽样约束）。
+- 语义：手写段 = 人工优选段，应每轮必测；订阅段 = 未优选全量，随机探索。
 
 ### 1b. 自建池（上轮赢家直接复测）
 - 取**最近一轮** `history/best_*.txt` 的上榜 IP（延迟 < `SELF_LAT`）→ 入自建池 `.p3`（裸 IP，直接进池）。
@@ -188,6 +194,7 @@ cron（17 0,6-23 * * *，系统 crontab 写死，不在 config.txt）
 | GitHub | GH_REPO / GH_TOKEN / GH_PROXY_PORT | — | — | 仓库 / token / 代理端口 |
 | GitHub | GH_CONNECT_TIMEOUT / GH_MAXTIME / GH_PURGE_TIMEOUT | 6 / 25 / 15 | 同 | API 连接/请求/purge 超时(秒) |
 | 通用 | SRC_CONNECT_TIMEOUT / SRC_FETCH_TIMEOUT | 8 / 30 | 同 | 段源连接/整体超时(秒) |
+| 通用 | SRC_RETRY | 2 | 同 | 段源拉取失败重试次数（0=不重试） |
 | 通用 | PRECHECK_TIMEOUT / PROBE_TIMEOUT / DL_CONNECT_TIMEOUT | 12 / 15 / 5 | 同 | 预检/429探测/下载连接超时(秒) |
 | 通用 | LOG_KEEP_LINES | 500 | 同 | 日志瘦身保留行数 |
 | 结果筛选 | TOPN | 10 | 10 | 最终上榜条数 |
@@ -258,7 +265,7 @@ history/ ──上轮best──> .p3 自建池(复测+定向)
                           ▼
               cfst HTTPing(-tl SELF_LAT) → .lat.csv
                           ▼
-              快筛(前DL_TOPN, 1MB) → 三级多样性筛选 → 精测(前FAST_TOPN, 9.1MB x2)
+              快筛(前DL_TOPN, 1MB) → 三级多样性筛选 → 精测(前FAST_TOPN, 9.1MB x DL_RUNS)
                           ▼
               $RESULT_FILE (TopN) + history/ 归档
                           ▼ (run.sh 统一调度)
