@@ -48,7 +48,7 @@ LOG_KEEP_LINES=1000
 #   V4 开启 → run_v4.sh 追加（带 "# --- IPv4 ---" 分隔行）
 #   两栈都开 → 一个文件里先 v6 后 v4；每轮开始 run.sh 会清空它
 # 移植到不同运营商时只改这一行
-RESULT_FILE="best_ip_dianxin.txt"
+RESULT_FILE=""
 
 # ==================== GitHub 配置 ====================
 
@@ -86,17 +86,16 @@ V6_DL_TOPN=24
 #   16 x 2 ≈ 290MB/轮（当前值）；20 x 2 ≈ 366MB/轮；15 x 1 ≈ 160MB/轮
 V6_FAST_TOPN=16
 # 上榜多样性：同一 /48 段最多上榜条数（防止榜单被单一 /48 包揽、段故障时全军覆没；不足时按速度顺位回填）
-V6_DIV_SEG_MAX=3
+V6_DIV_SEG_MAX=5
 # 上榜多样性：同地区（机场码，如 HKG/LAX/MAA）最多上榜条数（不足时按速度顺位回填）
-V6_DIV_COLO_MAX=9
+V6_DIV_COLO_MAX=10
 # 快筛机场白名单（IATA 机场码，英文逗号分隔，可带空格）：延迟测速结束后，只有这些机场的 IP
 # 能进入快筛候选；白名单内 IP 不足 DL_TOPN 时，从完整延迟列表按"延迟从低到高"补位
 # （补位不看机场，保证快筛数量；候选本身不足时有多少补多少）。
-# 空字符串 "" = 不限制（纯按延迟取前 DL_TOPN，等价于旧版 COLO_PICK=0 的行为）。
+# 空字符串 "" = 不限制（纯按延迟取前 DL_TOPN）。
 # 常见码：MAA 金奈 · BOM 孟买 · DEL 德里 · HKG 香港 · SIN 新加坡 · NRT 东京成田
 #        SJC 圣何塞 · LAX 洛杉矶 · SEA 西雅图 · PDX 波特兰 · FRA 法兰克福 · AMS 阿姆斯特丹
-V6_COLO_ALLOW="MAA,BOM,DEL,HKG"
-
+V6_COLO_ALLOW="MAA,BOM,DEL"
 
 # ---- 池构建 ----
 
@@ -212,13 +211,12 @@ V4_DL_TOPN=24
 # 流量估算同 v6：16 x 2 ≈ 290MB/轮（当前值）
 V4_FAST_TOPN=16
 # 上榜多样性：同一 /24 段最多上榜条数（同 v6 语义，不足时按速度顺位回填）
-V4_DIV_SEG_MAX=3
+V4_DIV_SEG_MAX=5
 # 上榜多样性：同地区（机场码）最多上榜条数（不足时按速度顺位回填）
-V4_DIV_COLO_MAX=9
+V4_DIV_COLO_MAX=10
 # 快筛机场白名单（同 v6）：只有白名单内机场的 IP 能进快筛，不足 DL_TOPN 时按延迟补位
 # 空字符串 "" = 不限制
 V4_COLO_ALLOW=""
-
 
 # ---- 池构建 ----
 
