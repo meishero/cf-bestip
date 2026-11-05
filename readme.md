@@ -13,15 +13,15 @@
 
 ```
 cf-bestip/
-├── best_ip_v6_yidong.txt / best_ip_v4_yidong.txt / status_yidong.txt    ← 移动路由自动上传（Contents API）
-├── best_ip_v6_dianxin.txt / best_ip_v4_dianxin.txt / status_dianxin.txt ← 电信路由自动上传
-├── src/        当前版本脚本与配置（脱敏模板：GH_REPO / GH_TOKEN / STATUS_FILE / *_RESULT_FILE 已置空）
+├── best_ip_yidong.txt / status_yidong.txt     ← 移动路由自动上传（v6+v4 合并成一个文件）
+├── best_ip_dianxin.txt / status_dianxin.txt   ← 电信路由自动上传
+├── src/        当前版本脚本与配置（脱敏模板：GH_REPO / GH_TOKEN / STATUS_FILE / RESULT_FILE 已置空）
 ├── cfstyd/     移动路由 /data/cfst 整目录快照（含 history/ 与日志，人工留档）
 └── cfstdx/     电信路由 /data/cfst 整目录快照
 ```
 
 - 根目录的 `best_ip_*` / `status_*` 由路由器通过 GitHub Contents API 直接写入，`.gitignore` 已排除，**本地 git 不跟踪**（避免 `git push` 覆盖运行产物）。
-- 同一套脚本部署到不同运营商的路由器时，只改 `V6/V4_RESULT_FILE` 与 `STATUS_FILE` 的前缀（`yidong` / `dianxin`），各机互不覆盖。
+- 同一套脚本部署到不同运营商的路由器时，只改 `RESULT_FILE` 与 `STATUS_FILE` 的文件名（`best_ip_yidong.txt` / `best_ip_dianxin.txt`），各机互不覆盖。
 - 另一个运营商路由器的 `status_*.txt` 最后更新时间超过 2 小时 = 那台机器掉线或 cron 没跑。
 
 ### 0.2 调度链
@@ -35,8 +35,7 @@ cron（10 轮/天，01:00-06:00 不跑，其余每 2 小时一轮，错开整点
         ├→ timeout -t V4_TIMEUP sh run_v4.sh   → RC_V4
         └→ sh githubpush.sh $RC_V6 $RC_V4
              ├→ GH_UPLOAD_ENABLE=0 → 整体跳过
-             ├→ 上传 $V6_RESULT_FILE（RC=0 且文件非空才传）
-             ├→ 上传 $V4_RESULT_FILE
+             ├→ 上传 $RESULT_FILE（v6/v4 合并的单个文件；任一栈 RC=0 且文件非空才传）
              └→ 上传 $STATUS_FILE（每轮覆盖，健康状态一览）
 ```
 
@@ -167,8 +166,10 @@ cron（10 轮/天，01:00-06:00 不跑，其余每 2 小时一轮，错开整点
 ### 3. 下载闸门 + 4a 快筛（只做淘汰门槛）
 
 - 闸门：HEAD 探测 `DL_URL`，429 则 `wait_429_clear`，超限 → **放弃本轮**。
-- 候选抽取（按机场分组采样）：从**全部**延迟候选里，每个机场（colo）取延迟最低的 `COLO_PICK`（5）个，
-  强制每个机场都有代表进快筛；不足 `DL_TOPN`（24）时按延迟顺位回填；`COLO_PICK=0` 退化为纯延迟顺位。
+- 候选抽取（**机场白名单**，v4 起取代旧的 `COLO_PICK` 配额采样）：只让 `COLO_ALLOW` 里列出的机场
+  （IATA 码，逗号分隔，如 `MAA,BOM,DEL,HKG`）的 IP 进入快筛；白名单内的不够 `DL_TOPN`（24）时，
+  从**按延迟升序排好的完整列表**里依次补位（补位不看机场，保证快筛数量）；`COLO_ALLOW=""` = 不限制。
+- 每轮日志会打印一行"快筛候选 24 个（机场白名单：…）：MAA×10 BOM×8 …"，可直接核对白名单是否生效。
 - 快筛：入选候选逐个（串行）下载 `FAST_URL`（1MB）1 次，`curl --resolve` 强制 IP、`--max-time $DL_MAXTIME`。
 - **速度口径 = 稳态速度**：`size_download / (time_total - time_starttransfer)`，剔除 TCP/TLS 握手与首包等待。
   实测同一 IP：1MB 样本按 curl `speed_download` 只有真实值的 1/2.4~1/4（握手占比过半）；9.1MB 样本相差 6%~14%。
@@ -179,7 +180,7 @@ cron（10 轮/天，01:00-06:00 不跑，其余每 2 小时一轮，错开整点
 - 为什么不再按快筛排序：1MB 样本与 9MB 精测的 Spearman 相关性只有 **0.42~0.94（均值 0.71）**，
   且对低延迟机场**系统性低估更狠**（MAA 2.36× vs BOM 1.68×），按它排等于让噪声决定谁进精测——
   历史多轮里"快筛第 1 名"在精测中掉到第 7~12 名。
-- 配置项：`DL_TOPN=24`、`COLO_PICK=5`、`FAST_URL`、`DL_MAXTIME=10`、`DL_RETRY=3`、`PICK_MODE=lat`。
+- 配置项：`DL_TOPN=24`、`COLO_ALLOW`、`FAST_URL`、`DL_MAXTIME=10`、`DL_RETRY=3`、`PICK_MODE=lat`。
 
 ### 4a-2. 多样性筛选（快筛 → 精测的入选名单）
 - 从**已定序**的幸存名单取 `FAST_TOPN`（16）个进入精测，约束：**同一 /48 最多 `DIV_SEG_MAX`（2）条、同地区（机场码）最多 `DIV_COLO_MAX`（7）条**。
@@ -195,10 +196,17 @@ cron（10 轮/天，01:00-06:00 不跑，其余每 2 小时一轮，错开整点
 - 单轮精测 16×2=32 次下载，约 292MB、181s。
 - 配置项：`DL_URL`、`DL_MAXTIME=10`、`DL_RETRY=3`、`DL_RUNS=2`。
 
-### 5. 排序输出 + 归档
-- 精测速度降序取前 `TOPN=15` → `v6/$RESULT_FILE`（文件名由 `V6_RESULT_FILE` 决定，如 `best_ip_v6_yidong.txt`）；
-  首行 `# updated: 时间戳`，行格式 `[ip]:443#ip-443-延迟ms-速度MB/s-地区`（v4 无方括号）。
-- 归档 `history/best_时间戳.txt`，**超过 `KEEP=48` 份删最旧**（学习机制的输入，不可随意清空）。
+### 5. 排序输出 + 归档（v4：两栈合并成一个结果文件）
+- 精测速度降序取前 `TOPN=15`，写入 **合并结果文件** `/data/cfst/$RESULT_FILE`：
+  | 栈 | 行为 |
+  |---|---|
+  | **v6** | **截断 + 写头部**（`# updated: 时间戳`）+ 自己的 15 条（`[ip]:443#...`） |
+  | **v4** | **追加**：先写一行 `# --- IPv4 ---` 分隔，再追加自己的 15 条（`ip:443#...`，无方括号） |
+  | 只跑一个栈 | 另一个栈不产出时，文件里就只有它的内容（v4 发现文件不存在/超过 2 小时会自建头部） |
+
+  合并由 `run.sh` 保证顺序：每轮开始先 `rm -f $RESULT_FILE`，然后 v6 写、v4 追加——所以文件永远只反映**本轮**结果。
+- 归档 `history/best_时间戳.txt`：**只存本栈的条目**（v6 在 v4 追加之前就归档），因此学习机制不会吃到对方栈的段。
+  **超过 `KEEP=48` 份删最旧**（学习机制的输入，不可随意清空）。
 - 完成日志一行含：最优 IP / 延迟 / 速度 / 粗筛幸存数 / 延迟候选数 / 快筛数 / 精测数 / 上榜数 / **本轮下载流量** / 机场分布；
   速度 ≥ `SPEED_PASS=3.0` 时附加"达标"标注（实测上限 4.07MB/s，旧值 8 永远不触发）。
 - 日志：`v6/run.log` 保留最近 `LOG_KEEP_LINES=1000` 行（约 10 轮）；`v6/cfst_run.log` 每轮按 `tail -c 20000` 修剪
@@ -252,10 +260,11 @@ cron（10 轮/天，01:00-06:00 不跑，其余每 2 小时一轮，错开整点
 | 通用 | SRC_RETRY | 2 | 同 | 段源拉取失败重试次数 |
 | 通用 | PRECHECK_TIMEOUT / PROBE_TIMEOUT / DL_CONNECT_TIMEOUT | 12 / 15 / 5 | 同 | 预检/429探测/下载连接超时(秒) |
 | 通用 | LOG_KEEP_LINES | 1000 | 同 | 运行日志保留行数（约 10 轮） |
+| 通用 | RESULT_FILE | best_ip_dianxin.txt | best_ip_yidong.txt | **两栈合并**的结果文件名（/data/cfst/ 根目录；v6 写、v4 追加） |
 | 结果筛选 | TOPN | 15 | 15 | 最终上榜条数 |
 | 结果筛选 | DL_TOPN | 24 | 24 | 延迟榜进快筛名额（原 45，快筛只做门槛后收紧） |
 | 结果筛选 | FAST_TOPN | 16 | 16 | 快筛进精测名额（比 TOPN 多 1~3 个留挑选余地） |
-| 结果筛选 | COLO_PICK | 5 | 5 | 快筛每机场最多入选数（0=关分组采样） |
+| 结果筛选 | COLO_ALLOW | "MAA,BOM,DEL,HKG" | "SIN,NRT,SJC" | 快筛机场白名单（逗号分隔 IATA 码；空=不限制，不足按延迟补位） |
 | 结果筛选 | DIV_SEG_MAX | 2 | 2 | 同 /48(v6)//24(v4) 上限 |
 | 结果筛选 | DIV_COLO_MAX | 7 | 7 | 同地区上限（名额收紧后此值开始成为约束） |
 | 池构建 | SEG_PICK | 20 | 20 | 每轮入池段总数 |
@@ -327,13 +336,13 @@ history/ ──上轮best──> .p3 自建池(复测+定向)
                           ▼
          cfst HTTPing 两段式：t=1@SELF_LAT+60 → t=4@SELF_LAT + 丢包≤0.2 → .lat.csv
                           ▼
-     快筛(COLO_PICK分组取前DL_TOPN, 1MB, 稳态速度) → 中位60%淘汰
+     快筛(机场白名单 COLO_ALLOW 取前 DL_TOPN, 1MB, 稳态速度) → 中位60%淘汰
                           ▼
          PICK_MODE 定序(lat) → 三级多样性筛选 → 精测(前FAST_TOPN, 9.1MB x 2 次取平均)
                           ▼   AVG=0 剔除
-                 $RESULT_FILE (TopN) + history/ 归档
+                 $RESULT_FILE (v6 写 / v4 追加，TopN) + history/ 归档
                           ▼ (run.sh 统一调度)
-        githubpush.sh → $V6/V4_RESULT_FILE + $STATUS_FILE → GitHub/jsDelivr
+        githubpush.sh → $RESULT_FILE（合并） + $STATUS_FILE → GitHub/jsDelivr
 ```
 
 ---
@@ -359,6 +368,8 @@ history/ ──上轮best──> .p3 自建池(复测+定向)
 | 15 | 流量计量修正：`.bytes` 清空点从"精测前"移到"快筛前" | 原统计漏掉快筛的 ~24MB/轮（日志报 279MB，实际整轮 303MB） | 无 |
 | 16 | 调度从 19 轮/天改为 **10 轮/天**（01:00-06:00 停跑，其余每 2 小时一轮，错开整点 :17） | 19 轮≈5.8GB/天；01-06 点与 19-23 点的榜单中位速度 <0.8MB/s，测了也没人用 | 流量 5.8→3.0GB/天；最长空窗 6 小时（00:17→06:17） |
 | 17 | 段级学习改为**独立于订阅**：学习 key 直接成段（v6 补 `::/48`、v4 原样用 `x.y.z.0/24`），只有订阅池存在时才额外合并池内更细段 | 原实现是"拿学习 key 去订阅池里找同款"，隐含假设池里一定有该段；一旦订阅换成少量本地段并删掉 `.seg.cache` 兜底，学习段整体归 0（电信机实测），而它的语义本应是"历史反复上榜的段" | 无：订阅存在时去重后仍是同一条段，输出与旧版一致 |
+| 18 | 废弃 `COLO_PICK`（每机场配额采样），改为**机场白名单** `COLO_ALLOW`：延迟测速后只让指定机场的 IP 进快筛；白名单内不足 `DL_TOPN` 时按延迟升序补位（补位不看机场） | 旧的「每机场最多 N 个」在机场数少时形同虚设——补位阶段不看配额，实测能把单机场顶到 18/24；白名单语义更直接：只要这几个机场，有多少算多少 | 快筛候选可能高度集中，多样性交给 `DIV_SEG_MAX`/`DIV_COLO_MAX` 兜 |
+| 19 | 结果文件合并：取消 `best_ip_v6_*.txt` / `best_ip_v4_*.txt`，改为单个 `RESULT_FILE`（如 `best_ip_dianxin.txt`）；v6 截断写入、v4 追加，`run.sh` 每轮先清空 | 两个文件要分别配、分别上传，消费方还得自己合并；合并后一次上传、一个地址 | 榜单里 v6/v4 混排（用 `# --- IPv4 ---` 分隔），解析时跳过 `#` 行即可 |
 
 **三种配置的实测对比（同一台移动路由）**
 

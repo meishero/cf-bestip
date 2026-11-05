@@ -43,6 +43,13 @@ DL_CONNECT_TIMEOUT=5
 # 1000 行 ≈ 13 轮（约 2/3 天），够回看趋势；日志留在 /data（重启不丢），勿再放大以免挤占 UBI 空间
 LOG_KEEP_LINES=1000
 
+# 【结果文件】两栈合并输出到 /data/cfst/ 根目录，不再分 v4/v6 两个文件：
+#   V6 开启 → run_v6.sh 写入（截断 + "# updated" 头部 + v6 条目）
+#   V4 开启 → run_v4.sh 追加（带 "# --- IPv4 ---" 分隔行）
+#   两栈都开 → 一个文件里先 v6 后 v4；每轮开始 run.sh 会清空它
+# 移植到不同运营商时只改这一行
+RESULT_FILE="best_ip_dianxin.txt"
+
 # ==================== GitHub 配置 ====================
 
 # 目标仓库（格式：用户名/仓库名）
@@ -72,9 +79,6 @@ STATUS_FILE=""
 
 # 最终排名保留名次（结果文件与 GitHub 榜单条数）
 V6_TOPN=15
-# 结果文件名（本地生成 + GitHub 同名上传）：移植到不同宽带运营商的路由器时，只改这里即可整套复用——
-# 移动宽带用 best_ip_v6_yidong.txt、电信改 best_ip_v6_dianxin.txt；多台路由器可共用一个 GitHub 仓库互不覆盖
-V6_RESULT_FILE=""
 # 延迟测速后进入快筛的名次（快筛只做淘汰门槛，DL_TOPN 越大流量越大；45→24 省 ~21MB/轮）
 V6_DL_TOPN=24
 # 快筛后进入精测的名次（建议比 TOPN 多 1~3 个，给最终榜单留挑选余地）
@@ -85,11 +89,14 @@ V6_FAST_TOPN=16
 V6_DIV_SEG_MAX=3
 # 上榜多样性：同地区（机场码，如 HKG/LAX/MAA）最多上榜条数（不足时按速度顺位回填）
 V6_DIV_COLO_MAX=9
-# 快筛候选抽取（按机场分组采样）：从全部延迟候选里，每个机场（colo）取延迟最低的
-# COLO_PICK 个进快筛，强制每个机场都有代表（防单一机场延迟优势霸榜，实测曾出现
-# 30 个快筛候选 100% 同机场）；不足 DL_TOPN 时按延迟顺位回填。
-# 0 = 关闭分组采样，退回纯延迟顺位（"延迟最优优先"模式，会牺牲机场多样性）
-V6_COLO_PICK=6
+# 快筛机场白名单（IATA 机场码，英文逗号分隔，可带空格）：延迟测速结束后，只有这些机场的 IP
+# 能进入快筛候选；白名单内 IP 不足 DL_TOPN 时，从完整延迟列表按"延迟从低到高"补位
+# （补位不看机场，保证快筛数量；候选本身不足时有多少补多少）。
+# 空字符串 "" = 不限制（纯按延迟取前 DL_TOPN，等价于旧版 COLO_PICK=0 的行为）。
+# 常见码：MAA 金奈 · BOM 孟买 · DEL 德里 · HKG 香港 · SIN 新加坡 · NRT 东京成田
+#        SJC 圣何塞 · LAX 洛杉矶 · SEA 西雅图 · PDX 波特兰 · FRA 法兰克福 · AMS 阿姆斯特丹
+V6_COLO_ALLOW="MAA,BOM,DEL,HKG"
+
 
 # ---- 池构建 ----
 
@@ -199,8 +206,6 @@ V6_DL_URL="https://testingcf.jsdelivr.net/npm/typescript@5.4.5/lib/typescript.js
 
 # 最终排名保留名次（结果文件与 GitHub 榜单条数）
 V4_TOPN=15
-# 结果文件名（本地生成 + GitHub 同名上传）：同 v6 语义，移动 best_ip_v4_yidong.txt、电信 best_ip_v4_dianxin.txt
-V4_RESULT_FILE=""
 # 延迟测速后进入快筛的名次（快筛只做淘汰门槛）
 V4_DL_TOPN=24
 # 快筛后进入精测的名次（建议比 TOPN 多 1~3 个）
@@ -210,9 +215,10 @@ V4_FAST_TOPN=16
 V4_DIV_SEG_MAX=3
 # 上榜多样性：同地区（机场码）最多上榜条数（不足时按速度顺位回填）
 V4_DIV_COLO_MAX=9
-# 快筛候选抽取（按机场分组采样，同 v6）：每个机场取延迟最低的 COLO_PICK 个进快筛，
-# 强制每个机场都有代表；不足 DL_TOPN 时按延迟顺位回填；0 = 关闭退回纯延迟顺位
-V4_COLO_PICK=6
+# 快筛机场白名单（同 v6）：只有白名单内机场的 IP 能进快筛，不足 DL_TOPN 时按延迟补位
+# 空字符串 "" = 不限制
+V4_COLO_ALLOW=""
+
 
 # ---- 池构建 ----
 

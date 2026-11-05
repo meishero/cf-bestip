@@ -9,8 +9,7 @@
 # 通道策略：先直连 api.github.com，网络层失败自动改走
 #           config.txt 中 GH_PROXY_PORT 指定的本机代理重试
 # 上传失败只记日志，不影响本地结果
-# 外部调用：raw.githubusercontent.com/<GH_REPO>/main/<V6_RESULT_FILE>
-#           raw.githubusercontent.com/<GH_REPO>/main/<V4_RESULT_FILE>
+# 外部调用：raw.githubusercontent.com/<GH_REPO>/main/<RESULT_FILE>（两栈合并的单个文件）
 # ============================================================
 PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH
 
@@ -111,21 +110,19 @@ gh_put() {  # 参数1 = 本地文件 参数2 = 仓库内路径 参数3 = 提交�
 }
 
 UPNOTE=""
-# ---- v6 结果上传 ----
-if [ "$V6RC" = "99" ]; then
-    UPNOTE="${UPNOTE}v6✗(已关闭)"
-elif [ "$V6RC" = "0" ] && [ -s "$DIR/v6/$V6_RESULT_FILE" ]; then
-    gh_put "$DIR/v6/$V6_RESULT_FILE" "$V6_RESULT_FILE" "cfst v6 bestip top$V6_TOPN $(date '+%m-%d %H:%M')" "$DIR/.push_v6.md5" && UPNOTE="${UPNOTE}v6✓"
+# ---- 合并结果上传：v6 写头部 + v4 追加，最终只有一个 $RESULT_FILE ----
+# 栈状态（用于 status.txt 里说明本轮是哪个栈产出的）
+[ "$V6RC" = "0" ]  && UPNOTE="${UPNOTE}v6✓ "
+[ "$V6RC" = "99" ] && UPNOTE="${UPNOTE}v6✗(已关闭) "
+[ "$V6RC" != "0" ] && [ "$V6RC" != "99" ] && UPNOTE="${UPNOTE}v6✗(失败/无结果) "
+[ "$V4RC" = "0" ]  && UPNOTE="${UPNOTE}v4✓ "
+[ "$V4RC" = "99" ] && UPNOTE="${UPNOTE}v4✗(已关闭) "
+[ "$V4RC" != "0" ] && [ "$V4RC" != "99" ] && UPNOTE="${UPNOTE}v4✗(失败/无结果) "
+if { [ "$V6RC" = "0" ] || [ "$V4RC" = "0" ]; } && [ -s "$DIR/$RESULT_FILE" ]; then
+    gh_put "$DIR/$RESULT_FILE" "$RESULT_FILE" "cfst bestip $(date '+%m-%d %H:%M')" "$DIR/.push.md5" \
+        && UPNOTE="${UPNOTE}best_ip✓" || UPNOTE="${UPNOTE}best_ip✗(上传失败)"
 else
-    UPNOTE="${UPNOTE}v6✗(失败/无结果)"
-fi
-# ---- v4 结果上传 ----
-if [ "$V4RC" = "99" ]; then
-    UPNOTE="${UPNOTE} v4✗(已关闭)"
-elif [ "$V4RC" = "0" ] && [ -s "$DIR/v4/$V4_RESULT_FILE" ]; then
-    gh_put "$DIR/v4/$V4_RESULT_FILE" "$V4_RESULT_FILE" "cfst v4 bestip top$V4_TOPN $(date '+%m-%d %H:%M')" "$DIR/.push_v4.md5" && UPNOTE="${UPNOTE} v4✓"
-else
-    UPNOTE="${UPNOTE} v4✗(失败/无结果)"
+    UPNOTE="${UPNOTE}best_ip✗(本轮无结果)"
 fi
 
 # ---- 状态文件上传：一次往返即可掌握整套系统健康状态 ----

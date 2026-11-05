@@ -13,8 +13,9 @@
 #   /data/cfst/githubpush.sh   GitHub 上传独立子脚本
 #   /data/cfst/run_v6.sh       IPv6 子脚本（独立可跑，只写本地结果）
 #   /data/cfst/run_v4.sh       IPv4 子脚本（独立可跑，只写本地结果）
-#   /data/cfst/v6/             IPv6 数据独立目录（结果文件名 = V6_RESULT_FILE）
-#   /data/cfst/v4/             IPv4 数据独立目录（结果文件名 = V4_RESULT_FILE）
+#   /data/cfst/v6/             IPv6 数据独立目录（池/锁/日志/history，不含结果文件）
+#   /data/cfst/v4/             IPv4 数据独立目录（同上）
+#   /data/cfst/<RESULT_FILE>   两栈合并的结果文件（v6 先写并带头部，v4 追加；每轮开始清空）
 #
 # 【退出码约定】子脚本退出码：0=成功 1=失败 99=该栈被开关关闭（不上传）
 # 【注意】本机 busybox v1.25.1 的 timeout 只支持 -t 秒 语法（GNU 的
@@ -36,6 +37,11 @@ if [ ! -f "$DIR/config.txt" ] || ! sh -n "$DIR/config.txt" 2>/dev/null; then
 fi
 . "$DIR/config.txt"
 LOG_KEEP_LINES="${LOG_KEEP_LINES:-500}"
+RESULT_FILE="${RESULT_FILE:-best_ip_dianxin.txt}"
+
+# 每轮开始清空合并结果文件：v6 会重新写入（截断+头部），v4 追加自己的条目。
+# 这样两栈任意组合都只保留"本轮"的结果，不会残留上一轮的内容。
+rm -f "$DIR/$RESULT_FILE"
 
 # ---- 0.5 总调度锁（防止总流程重入；子脚本另有各自锁） ----
 LOCK="$DIR/.master.lock"

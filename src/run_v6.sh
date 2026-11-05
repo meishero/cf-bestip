@@ -30,14 +30,14 @@
 #    任何一次失败（429 / 超时 / 5xx）重试，单次样本重试上限 DL_RETRY 次
 #    【v2】速度口径改为"稳态速度" = 下载量/(总耗时-首字节耗时)，剔除握手与慢启动，
 #       修正原 speed_download 口径 15%~70% 的系统性低估
-# 5. 排序：下载速度降序，取前 TOPN → 结果文件（文件名由 config.txt 的 V6_RESULT_FILE 决定，可配）
+# 5. 排序：下载速度降序，取前 TOPN → 合并结果文件（config.txt 的 RESULT_FILE，位于 /data/cfst/ 根目录）
 #    行格式：[ip]:443#ip-443-延迟ms-速度MB/s-地区
 #    例：[2606:4700:57:641:561f:36e8:765e:ad62]:443#2606:4700:57:641:561f:36e8:765e:ad62-443-137ms-5.45MB/s-HK
 #    history/（结果归档，反哺自建学习池 + 段级学习）
-# 6. 结果只写本地：结果文件（TopN）+ history/ 归档
-#    GitHub 上传统一由总调度 run.sh 在 v6/v4 都完成后执行（上传名 = V6_RESULT_FILE）
-#    外部调用：raw.githubusercontent.com/meishero/cf-bestip/main/<V6_RESULT_FILE>
-#             cdn.jsdelivr.net/gh/meishero/cf-bestip@main/<V6_RESULT_FILE>
+# 6. 结果只写本地：合并结果文件（v6 先写并截断）+ history/ 归档（只含 v6 条目）
+#    GitHub 上传统一由总调度 run.sh 在 v6/v4 都完成后执行（上传名 = RESULT_FILE）
+#    外部调用：raw.githubusercontent.com/meishero/cf-bestip/main/<RESULT_FILE>
+#             cdn.jsdelivr.net/gh/meishero/cf-bestip@main/<RESULT_FILE>
 #
 # 【配置】全部参数已迁移至 /data/cfst/config.txt 统一维护
 #   （v6/v4 独立配置段 + 三个总开关：GH_UPLOAD_ENABLE / V6_ENABLE / V4_ENABLE）
@@ -65,7 +65,7 @@ fi
 
 # 将 config.txt 的 v6 配置映射到脚本内部变量
 KEEP="$V6_KEEP"; TOPN="$V6_TOPN"; DL_TOPN="$V6_DL_TOPN"; FAST_TOPN="$V6_FAST_TOPN"
-RESULT_FILE="$V6_RESULT_FILE"; [ -z "$RESULT_FILE" ] && RESULT_FILE="best_ip_v6.txt"
+RESULT_FILE="${RESULT_FILE:-best_ip_dianxin.txt}"
 SEG_PICK="$V6_SEG_PICK"; LEARN_MAX="$V6_LEARN_MAX"; SELF_MIN="$V6_SELF_MIN"; SELF_LAT="$V6_SELF_LAT"
 LEARN_WINDOW="$V6_LEARN_WINDOW"; [ -z "$LEARN_WINDOW" ] && LEARN_WINDOW=24
 AVOID_KEEP="$V6_AVOID_KEEP"; [ -z "$AVOID_KEEP" ] && AVOID_KEEP=48
@@ -81,7 +81,7 @@ LOCAL_IPS_PER_SEG="$V6_LOCAL_IPS_PER_SEG"; [ -z "$LOCAL_IPS_PER_SEG" ] && LOCAL_
 LAT_THREAD="$V6_LAT_THREAD"; [ -z "$LAT_THREAD" ] && LAT_THREAD=32
 DIV_SEG_MAX="$V6_DIV_SEG_MAX"; [ -z "$DIV_SEG_MAX" ] && DIV_SEG_MAX=2
 DIV_COLO_MAX="$V6_DIV_COLO_MAX"; [ -z "$DIV_COLO_MAX" ] && DIV_COLO_MAX=3
-COLO_PICK="$V6_COLO_PICK"; [ -z "$COLO_PICK" ] && COLO_PICK=3
+COLO_ALLOW="$V6_COLO_ALLOW"
 TGT_PER_IP="$V6_TGT_PER_IP"; [ -z "$TGT_PER_IP" ] && TGT_PER_IP=25
 TGT_MAX_PREFIX="$V6_TGT_MAX_PREFIX"; [ -z "$TGT_MAX_PREFIX" ] && TGT_MAX_PREFIX=16
 SPEED_PASS="$V6_SPEED_PASS"; [ -z "$SPEED_PASS" ] && SPEED_PASS=8
@@ -757,24 +757,35 @@ FASTTMP="$V6DIR/.fast.tmp"
 : > "$FASTTMP"
 : > "$V6DIR/.bytes"   # 流量计数从快筛开始（含快筛 + 精测 + 重试），轮末统计后删除
 N=0
-# 快筛候选按机场（colo）分组采样：从全部延迟候选里，每个机场取延迟最低的 COLO_PICK 个，
-# 强制每个机场都有代表进快筛（防单一机场延迟优势霸榜，实测曾出现 30 个快筛候选 100% 同机场）；
-# 不足 DL_TOPN 时按延迟顺位回填；COLO_PICK=0 时退化为纯延迟顺位（延迟最优优先）
+# 快筛候选：机场白名单（COLO_ALLOW，逗号分隔 IATA 机场码，如 MAA,BOM,DEL；空 = 不限制）
+# 延迟测速结束后，只有白名单内机场的 IP 能进快筛；白名单内不够 DL_TOPN 时，从（按延迟升序
+# 排好的）完整列表里按延迟从低到高补位——补位不看机场，保证快筛数量（候选不足时有多少算多少）。
+# 说明：v4 起废弃 COLO_PICK（旧的"每机场最多 N 个"配额采样），改为白名单直选。
 FAST_SEL="$V6DIR/.fast.sel.lat"
-if [ "$COLO_PICK" -gt 0 ]; then
-    awk -F, 'NR>1 && $1 ~ /^[0-9a-f]*:/ {print $1"|"$5"|"$7}' "$V6DIR/.lat.csv" \
-        | awk -F'|' -v cp="$COLO_PICK" -v tn="$DL_TOPN" '
-        {
-            if (picked >= tn) next
-            if (colocnt[$3] < cp) { colocnt[$3]++; print $0; picked++ }
-            else { rest[++nr] = $0 }
+awk -F, 'NR>1 && $1 ~ /^[0-9a-f]*:/ {print $1"|"$5"|"$7}' "$V6DIR/.lat.csv" \
+    | awk -F'|' -v allow="$COLO_ALLOW" -v tn="$DL_TOPN" '
+    BEGIN {
+        wn = 0
+        if (allow != "") {
+            n = split(allow, a, ",")
+            for (i = 1; i <= n; i++) {
+                gsub(/^[ \t]+/, "", a[i]); gsub(/[ \t]+$/, "", a[i])
+                if (a[i] == "") continue
+                wl[toupper(a[i])] = 1; wn++
+            }
         }
-        END { for (i = 1; i <= nr && picked < tn; i++) { print rest[i]; picked++ } }
-        ' > "$FAST_SEL"
-else
-    awk -F, 'NR>1 && $1 ~ /^[0-9a-f]*:/ {print $1"|"$5"|"$7}' "$V6DIR/.lat.csv" \
-        | head -n "$DL_TOPN" > "$FAST_SEL"
-fi
+    }
+    {
+        if (picked >= tn) next
+        if (wn == 0) { print; picked++; next }              # 未配置白名单：纯延迟顺位
+        if (toupper($3) in wl) { print; picked++ }          # 白名单内：直接入选
+        else { rest[++nr] = $0 }                            # 白名单外：留作补位
+    }
+    END { for (i = 1; i <= nr && picked < tn; i++) { print rest[i]; picked++ } }
+    ' > "$FAST_SEL"
+COLOSEL=$(cut -d'|' -f3 "$FAST_SEL" 2>/dev/null | sort | uniq -c | awk '{printf "%s×%s ", $2, $1}')
+[ -z "$COLOSEL" ] && COLOSEL="（无）"
+echo "[$(date '+%m-%d %H:%M:%S')]快筛候选 $DL_TOPN 个（机场白名单：${COLO_ALLOW:-不限}）：${COLOSEL}" >> "$LOG"
 for entry in $(cat "$FAST_SEL" 2>/dev/null | grep .); do
     N=$((N + 1))
     ip="${entry%%|*}"; rest="${entry#*|}"; lat="${rest%%|*}"; colo="${rest##*|}"
@@ -904,7 +915,9 @@ if [ "$RCNT0" -eq 0 ]; then
     exit 1
 fi
 
-# ---- 5. 排序（速度降序）→ TopN → 结果文件（$RESULT_FILE）+ 归档 ----
+# ---- 5. 排序（速度降序）→ TopN → 合并结果文件（$RESULT_FILE）+ 归档 ----
+# 两栈合并模式：本脚本（v6）先写——截断 + 头部 + v6 条目；v4 之后追加自己的条目
+# 文件位于 /data/cfst/ 根目录，不再分 v6/v4 两个文件
 sort -rn "$RANKED" 2>/dev/null > "$RANKED.s" && mv "$RANKED.s" "$RANKED"
 
 # 行格式：[ip]:443#ip-443-延迟ms-速度MB/s-地区
@@ -915,14 +928,14 @@ sort -rn "$RANKED" 2>/dev/null > "$RANKED.s" && mv "$RANKED.s" "$RANKED"
         mb=$(awk -v v="$sp" 'BEGIN{printf "%.2f", v/1048576}')
         echo "[$ip]:443#$ip-443-${lat}ms-${mb}MB/s-$colo"
     done
-} > "$V6DIR/$RESULT_FILE"
+} > "$DIR/$RESULT_FILE"
 rm -f "$RANKED"
 
-RANKCNT=$(grep -vc '^#' "$V6DIR/$RESULT_FILE" 2>/dev/null)
+RANKCNT=$(grep -vc '^#' "$DIR/$RESULT_FILE" 2>/dev/null)
 [ -z "$RANKCNT" ] && RANKCNT=0
 
 # 第 1 名信息（用于完成日志）；跳过首行时间戳注释
-FIRST=$(grep -v '^#' "$V6DIR/$RESULT_FILE" 2>/dev/null | head -1)
+FIRST=$(grep -v '^#' "$DIR/$RESULT_FILE" 2>/dev/null | head -1)
 if [ -n "$FIRST" ]; then
     BESTIP=$(echo "$FIRST" | awk -F'[][#-]' '{print $2}')
     BESTLAT=$(echo "$FIRST" | awk -F'[][#-]' '{lat=$6; sub(/ms$/, "", lat); print lat}')
@@ -932,14 +945,15 @@ fi
 
 STAMP=$(date "+%Y%m%d_%H%M%S")
 mkdir -p "$V6DIR/history"
-cp "$V6DIR/$RESULT_FILE" "$V6DIR/history/best_$STAMP.txt"
+# 归档时机在 v4 追加之前，所以这份历史只含 v6 条目（学习机制按栈独立）
+cp "$DIR/$RESULT_FILE" "$V6DIR/history/best_$STAMP.txt"
 ls -t "$V6DIR"/history/best_*.txt 2>/dev/null | tail -n +$((KEEP + 1)) | while read f; do rm -f "$f"; done
 
 NOTE=""
 awk -v m="$BESTMB" -v sp="$SPEED_PASS" 'BEGIN{exit !(m+0 >= sp)}' && NOTE="（达到 ${SPEED_PASS}MB/s 标准）"
 DUR=$(( $(date +%s) - START_TS ))
 # 上榜机场分布（观测多样性是否生效）：如 "MAA×3 LAX×3 HKG×2 BOM×2 "
-COLO_DIST=$(grep -v '^#' "$V6DIR/$RESULT_FILE" 2>/dev/null | grep -oE '\-[A-Z]{3}$' | sort | uniq -c | awk '{printf "%s×%s ", substr($2,2), $1}')
+COLO_DIST=$(grep -v '^#' "$DIR/$RESULT_FILE" 2>/dev/null | grep -oE '\-[A-Z]{3}$' | sort | uniq -c | awk '{printf "%s×%s ", substr($2,2), $1}')
 # 本轮下载流量（快筛+精测实际消耗，用于观察每轮成本；DL_RUNS/FAST_TOPN 调整后看这里）
 DLMB=$(awk '{s+=$1} END{printf "%.0f", s/1048576}' "$V6DIR/.bytes" 2>/dev/null)
 [ -z "$DLMB" ] && DLMB=0
