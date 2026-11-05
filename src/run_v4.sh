@@ -353,19 +353,22 @@ if [ -s "$V4DIR/.seg.learn" ]; then
 fi
 LIPCNT=$(grep -c . "$V4DIR/.learn.ips" 2>/dev/null); [ -z "$LIPCNT" ] && LIPCNT=0
 [ "$LIPCNT" -gt 0 ] && echo "[$(date '+%m-%d %H:%M:%S')]  学习复测：$LIPCNT 个历史精确好 IP 直接入池" >> "$LOG"
-# 1c. 段级学习：1b-1 的学习 key（x.y.z.0/24）→ 与细分段池全字匹配 → 强制入池
+# 1c. 段级学习：1b-1 的学习 key（x.y.z.0/24）本身就是 CIDR → 直接成段
+#     【v3 修正】原实现只在订阅段池里"找同款"，订阅一断学习段就整体消失；
+#     而学习段的语义是"历史反复上榜的段"，必须独立于订阅存在。
+#     现在：① 学习 key 直接入池；② 订阅池里若也有同段（更细粒度）则合并去重。
 #     注意：grep -f 空文件会匹配全部行，必须先确保模式文件非空
-if [ "$SEGCNT" -gt 0 ] && [ -s "$V4DIR/.seg.learn" ]; then
-    if [ -s "$V4DIR/.seg.learn" ]; then
-        grep -Fxf "$V4DIR/.seg.learn" "$V4DIR/.seg.all" 2>/dev/null > "$V4DIR/.seg.keep"
-        if [ -s "$V4DIR/.seg.keep" ]; then
-            LEARNED=$(grep -c . "$V4DIR/.seg.keep")
-            if [ "$LEARNED" -gt "$LEARN_MAX" ]; then
-                head -n "$LEARN_MAX" "$V4DIR/.seg.keep" > "$V4DIR/.seg.keep.tmp"
-                mv "$V4DIR/.seg.keep.tmp" "$V4DIR/.seg.keep"
-                LEARNED=$LEARN_MAX
-            fi
-        fi
+if [ -s "$V4DIR/.seg.learn" ]; then
+    cp "$V4DIR/.seg.learn" "$V4DIR/.seg.keep"
+    if [ "$SEGCNT" -gt 0 ]; then
+        grep -Fxf "$V4DIR/.seg.learn" "$V4DIR/.seg.all" 2>/dev/null >> "$V4DIR/.seg.keep"
+    fi
+    sort -u "$V4DIR/.seg.keep" > "$V4DIR/.seg.keep.u" 2>/dev/null && mv "$V4DIR/.seg.keep.u" "$V4DIR/.seg.keep"
+    LEARNED=$(grep -c . "$V4DIR/.seg.keep" 2>/dev/null); [ -z "$LEARNED" ] && LEARNED=0
+    if [ "$LEARNED" -gt "$LEARN_MAX" ]; then
+        head -n "$LEARN_MAX" "$V4DIR/.seg.keep" > "$V4DIR/.seg.keep.tmp"
+        mv "$V4DIR/.seg.keep.tmp" "$V4DIR/.seg.keep"
+        LEARNED=$LEARN_MAX
     fi
 fi
 # 1d. 随机抽段补足名额（排除已学习段 + 最近已探索段，扩大探索覆盖）
@@ -488,7 +491,7 @@ cat "$V4DIR/.seg.exp" "$V4DIR/.seg.exp.local" "$V4DIR/.learn.ips" "$V4DIR/.p3" "
     | sort -u > "$V4DIR/pool.txt"
 PCNT=$(grep -c . "$V4DIR/pool.txt" 2>/dev/null)
 [ -z "$PCNT" ] && PCNT=0
-echo "[$(date '+%m-%d %H:%M:%S')]池构建：细分段源 $SEGCNT 段（学习段 $LEARNED + 随机段 $PICKED = $SEGTOTAL）+ 本地优选段 $LOCALCNT 段 → 展开 $EXPCNT 个段内随机 IP + 本地段展开 $LEXPCNT 个 + 学习复测 $LIPCNT 个 + 自建池 $SCNT 条 + 外部IP $IPCNT 条 → pool.txt 共 $PCNT 行" >> "$LOG"
+echo "[$(date '+%m-%d %H:%M:%S')]池构建：订阅段池 $SEGCNT 条 ｜ 学习段 $LEARNED 段（历史，独立于订阅）+ 随机段 $PICKED 段 = $SEGTOTAL 段 ｜ 本地优选段 $LOCALCNT 段 → 展开 $EXPCNT 个段内随机 IP + 本地段展开 $LEXPCNT 个 + 学习复测 $LIPCNT 个 + 自建池 $SCNT 条 + 外部IP $IPCNT 条 → pool.txt 共 $PCNT 行" >> "$LOG"
 rm -f "$V4DIR/.seg.all" "$V4DIR/.seg.local" "$V4DIR/.seg.local.norm" "$V4DIR/.seg.learn" "$V4DIR/.seg.keep" "$V4DIR/.seg.rest" "$V4DIR/.seg.rest0" "$V4DIR/.seg.pick" "$V4DIR/.seg.exp.in" "$V4DIR/.seg.exp" "$V4DIR/.seg.exp.in.local" "$V4DIR/.seg.exp.local" "$V4DIR/.learn.ips" "$V4DIR/.p3" "$V4DIR/.ips.all" "$V4DIR/.ips.pick"
 
 if [ "$PCNT" -eq 0 ]; then

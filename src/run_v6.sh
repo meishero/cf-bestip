@@ -446,34 +446,38 @@ if [ "$TGT_PER_IP" -gt 0 ] && [ -s "$V6DIR/.p3" ]; then
     TGCNT=$(grep -c . "$V6DIR/.p3.tgt" 2>/dev/null); [ -z "$TGCNT" ] && TGCNT=0
     [ "$TGCNT" -gt 0 ] && echo "[$(date '+%m-%d %H:%M:%S')]  学习定向：$SCNT 个历史好 IP → $TGCNT 个 /64 邻域随机 IP 入池" >> "$LOG"
 fi
-# 1c. 段级学习：1b-1 的学习 key（/48 前3组）→ 与段池按"前3组 key"包含匹配 → 强制入池
-#     匹配规则：池中的段（无论 /48 还是更细的 /52 /56 /64）只要落在学习 /48 范围内即命中
-if [ "$SEGCNT" -gt 0 ] && [ -s "$V6DIR/.seg.learn" ]; then
-    # 池侧：每条段 → "key 段原始行"（key = 前3组，:: 压缩展开）
-    awk '
-    {
-        p = index($0, "/"); addr = substr($0, 1, p-1)
-        k1="0"; k2="0"; k3="0"
-        pp = index(addr, "::")
-        if (pp > 0) {
-            nl = split(substr(addr,1,pp-1), L, ":")
-            k1=(nl>=1)?tolower(L[1]):"0"; k2=(nl>=2)?tolower(L[2]):"0"; k3=(nl>=3)?tolower(L[3]):"0"
-        } else {
-            m = split(addr, G, ":")
-            k1=(m>=1)?tolower(G[1]):"0"; k2=(m>=2)?tolower(G[2]):"0"; k3=(m>=3)?tolower(G[3]):"0"
-        }
-        print k1":"k2":"k3" "$0
-    }' "$V6DIR/.seg.all" > "$V6DIR/.seg.keyed"
-    # key 匹配 → 命中的段原始行入 .seg.keep
-    awk 'NR==FNR{lk[$1]=1;next} ($1 in lk){print $2}' \
-        "$V6DIR/.seg.learn" "$V6DIR/.seg.keyed" 2>/dev/null | sort -u > "$V6DIR/.seg.keep"
-    if [ -s "$V6DIR/.seg.keep" ]; then
-        LEARNED=$(grep -c . "$V6DIR/.seg.keep")
-        if [ "$LEARNED" -gt "$LEARN_MAX" ]; then
-            head -n "$LEARN_MAX" "$V6DIR/.seg.keep" > "$V6DIR/.seg.keep.tmp"
-            mv "$V6DIR/.seg.keep.tmp" "$V6DIR/.seg.keep"
-            LEARNED=$LEARN_MAX
-        fi
+# 1c. 段级学习：1b-1 的学习 key（/48 前3组）→ 直接成段，再并上订阅池里落在该 /48 内的更细段
+# 【v3 修正】原实现只在订阅段池里"找同款"，订阅一断（或段池里没有该 /48）学习段就整体消失，
+#     而学习段的语义本应是"历史反复上榜的段"——它必须独立于订阅存在。
+#     现在：① 学习 key 直接构造 a:b:c::/48 入池（不依赖订阅）
+#           ② 若订阅池里还有落在这个 /48 内的 /52 /56 /64，一并并入（去重后保留更细粒度）
+if [ -s "$V6DIR/.seg.learn" ]; then
+    sed 's/[[:space:]]*$//; /^$/d; s|$|::/48|' "$V6DIR/.seg.learn" > "$V6DIR/.seg.keep"
+    if [ "$SEGCNT" -gt 0 ]; then
+        # 池侧：每条段 → "key 段原始行"（key = 前3组，:: 压缩展开）
+        awk '
+        {
+            p = index($0, "/"); addr = substr($0, 1, p-1)
+            k1="0"; k2="0"; k3="0"
+            pp = index(addr, "::")
+            if (pp > 0) {
+                nl = split(substr(addr,1,pp-1), L, ":")
+                k1=(nl>=1)?tolower(L[1]):"0"; k2=(nl>=2)?tolower(L[2]):"0"; k3=(nl>=3)?tolower(L[3]):"0"
+            } else {
+                m = split(addr, G, ":")
+                k1=(m>=1)?tolower(G[1]):"0"; k2=(m>=2)?tolower(G[2]):"0"; k3=(m>=3)?tolower(G[3]):"0"
+            }
+            print k1":"k2":"k3" "$0
+        }' "$V6DIR/.seg.all" > "$V6DIR/.seg.keyed"
+        awk 'NR==FNR{lk[$1]=1;next} ($1 in lk){print $2}' \
+            "$V6DIR/.seg.learn" "$V6DIR/.seg.keyed" 2>/dev/null >> "$V6DIR/.seg.keep"
+    fi
+    sort -u "$V6DIR/.seg.keep" > "$V6DIR/.seg.keep.u" 2>/dev/null && mv "$V6DIR/.seg.keep.u" "$V6DIR/.seg.keep"
+    LEARNED=$(grep -c . "$V6DIR/.seg.keep" 2>/dev/null); [ -z "$LEARNED" ] && LEARNED=0
+    if [ "$LEARNED" -gt "$LEARN_MAX" ]; then
+        head -n "$LEARN_MAX" "$V6DIR/.seg.keep" > "$V6DIR/.seg.keep.tmp"
+        mv "$V6DIR/.seg.keep.tmp" "$V6DIR/.seg.keep"
+        LEARNED=$LEARN_MAX
     fi
 fi
 # 1d. 随机抽段补足名额（排除已学习段 + 最近已探索段，扩大探索覆盖）
@@ -657,7 +661,7 @@ else
 fi
 PCNT=$(grep -c . "$V6DIR/pool.txt" 2>/dev/null)
 [ -z "$PCNT" ] && PCNT=0
-echo "[$(date '+%m-%d %H:%M:%S')]池构建：细分段源 $SEGCNT 段（学习段 $LEARNED + 随机段 $PICKED = $SEGTOTAL）+ 本地优选段 $LOCALCNT 段 → 展开 $EXPCNT 个段内随机 IP + 本地段展开 $LEXPCNT 个 + 学习复测 $LIPCNT 个 + 定向 $TGCNT 个 + 自建池 $SCNT 条 + 外部IP $IPCNT 条 → pool.txt 共 $PCNT 行" >> "$LOG"
+echo "[$(date '+%m-%d %H:%M:%S')]池构建：订阅段池 $SEGCNT 条 ｜ 学习段 $LEARNED 段（历史，独立于订阅）+ 随机段 $PICKED 段 = $SEGTOTAL 段 ｜ 本地优选段 $LOCALCNT 段 → 展开 $EXPCNT 个段内随机 IP + 本地段展开 $LEXPCNT 个 + 学习复测 $LIPCNT 个 + 定向 $TGCNT 个 + 自建池 $SCNT 条 + 外部IP $IPCNT 条 → pool.txt 共 $PCNT 行" >> "$LOG"
 rm -f "$V6DIR/.seg.all" "$V6DIR/.seg.local" "$V6DIR/.seg.local.norm" "$V6DIR/.seg.learn" "$V6DIR/.seg.keep" "$V6DIR/.seg.rest" "$V6DIR/.seg.rest0" "$V6DIR/.seg.pick" "$V6DIR/.seg.exp" "$V6DIR/.seg.exp.local" "$V6DIR/.learn.ips" "$V6DIR/.p3" "$V6DIR/.p3.tgt" "$V6DIR/.seg.keyed" "$V6DIR/.ips.all" "$V6DIR/.ips.pick"
 
 if [ "$PCNT" -eq 0 ]; then
