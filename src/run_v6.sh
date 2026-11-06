@@ -23,10 +23,12 @@
 # 2. HTTPing 延迟测速两段式：t=1 粗扫（上限 SELF_LAT+60，只为缩小样本）→
 #    幸存者 t=LAT_TRYS 次取平均 + 丢包上限 LAT_LOSS（上限 SELF_LAT）；失败则探 429，退避后重扫
 # 3. 下载闸门：探测下载 URL，429 等到解除才开测
-# 4. 下载实测两阶段：
-#    4a 快筛：候选（DL_TOPN 个）每个下载 1 次 x 1MB（echarts.min.js），只做淘汰门槛：
-#       低于本轮速度中位数 60% 的剔除，幸存者按 PICK_MODE 定序（lat=延迟优先 / speed=速度优先）
-#    4b 精测：多样性筛选后前 FAST_TOPN 名每个下载 DL_RUNS 次 x 9.1MB 取平均；全样本失败的直接剔除
+# 4. 下载实测三阶段：
+#    4a-1 候选筛选：延迟测速后先按机场白名单排序，再做段筛/机场筛（DIV_SEG_MAX / DIV_COLO_MAX）
+#         选出 DL_TOPN 个进快筛——【v5】多样性在这一步生效，只决定"测谁"，不参与最终排名
+#    4a-2 快筛：DL_TOPN 个每个下载 1 次 x 1MB，低于本轮速度中位数 60% 的剔除，
+#         幸存者按 PICK_MODE 定序（lat=延迟优先 / speed=速度优先）
+#    4b 精测：按顺位取前 FAST_TOPN 个，每个下载 DL_RUNS 次 x 9.1MB 取平均；全样本失败剔除
 #    任何一次失败（429 / 超时 / 5xx）重试，单次样本重试上限 DL_RETRY 次
 #    【v2】速度口径改为"稳态速度" = 下载量/(总耗时-首字节耗时)，剔除握手与慢启动，
 #       修正原 speed_download 口径 15%~70% 的系统性低估
@@ -757,13 +759,13 @@ FASTTMP="$V6DIR/.fast.tmp"
 : > "$FASTTMP"
 : > "$V6DIR/.bytes"   # 流量计数从快筛开始（含快筛 + 精测 + 重试），轮末统计后删除
 N=0
-# 快筛候选：机场白名单（COLO_ALLOW，逗号分隔 IATA 机场码，如 MAA,BOM,DEL；空 = 不限制）
-# 延迟测速结束后，只有白名单内机场的 IP 能进快筛；白名单内不够 DL_TOPN 时，从（按延迟升序
-# 排好的）完整列表里按延迟从低到高补位——补位不看机场，保证快筛数量（候选不足时有多少算多少）。
-# 说明：v4 起废弃 COLO_PICK（旧的"每机场最多 N 个"配额采样），改为白名单直选。
-FAST_SEL="$V6DIR/.fast.sel.lat"
+# ---- 3a. 快筛候选（两步）----
+# ① 机场白名单：白名单内的 IP 按延迟在前、白名单外的按延迟在后（不截断，交给 ② 挑）
+# ② 段筛 + 机场筛（v5 起从"快筛→精测"前移到这里）：同一 /48 最多 DIV_SEG_MAX 条、
+#    同机场最多 DIV_COLO_MAX 条，三级放宽保证凑满 DL_TOPN——多样性决定"测谁"，不再扭曲最终排名
+WLSEL="$V6DIR/.fast.wl"
 awk -F, 'NR>1 && $1 ~ /^[0-9a-f]*:/ {print $1"|"$5"|"$7}' "$V6DIR/.lat.csv" \
-    | awk -F'|' -v allow="$COLO_ALLOW" -v tn="$DL_TOPN" '
+    | awk -F'|' -v allow="$COLO_ALLOW" '
     BEGIN {
         wn = 0
         if (allow != "") {
@@ -775,17 +777,42 @@ awk -F, 'NR>1 && $1 ~ /^[0-9a-f]*:/ {print $1"|"$5"|"$7}' "$V6DIR/.lat.csv" \
             }
         }
     }
-    {
-        if (picked >= tn) next
-        if (wn == 0) { print; picked++; next }              # 未配置白名单：纯延迟顺位
-        if (toupper($3) in wl) { print; picked++ }          # 白名单内：直接入选
-        else { rest[++nr] = $0 }                            # 白名单外：留作补位
+    { if (wn == 0 || toupper($3) in wl) print; else rest[++nr] = $0 }
+    END { for (i = 1; i <= nr; i++) print rest[i] }
+    ' > "$WLSEL"
+
+FAST_SEL="$V6DIR/.fast.sel"
+awk -F"|" -v sm="$DIV_SEG_MAX" -v cm="$DIV_COLO_MAX" -v tn="$DL_TOPN" '
+function key48(ip,   p,nl,nr,L,R) {
+    p = index(ip, "::")
+    if (p > 0) { nl = split(substr(ip,1,p-1), L, ":"); nr = split(substr(ip,p+2), R, ":") }
+    else { nl = split(ip, L, ":"); nr = 0 }
+    return ((nl>=1)?tolower(L[1]):"0") ":" ((nl>=2)?tolower(L[2]):"0") ":" ((nl>=3)?tolower(L[3]):"0")
+}
+{
+    if (picked < tn) {
+        k = key48($1); c = $3
+        if (!((k in sc) && sc[k] >= sm) && !((c in cc) && cc[c] >= cm)) {
+            sc[k]++; cc[c]++; s2[k]++; c2[c]++; print; picked++; next
+        }
     }
-    END { for (i = 1; i <= nr && picked < tn; i++) { print rest[i]; picked++ } }
-    ' > "$FAST_SEL"
+    r[++nr] = $0; rk[nr] = key48($1); rc[nr] = $3
+}
+END {
+    sm2 = sm + 1; cm2 = cm + 2
+    for (i = 1; i <= nr && picked < tn; i++)
+        if (!((rk[i] in s2) && s2[rk[i]] >= sm2) && !((rc[i] in c2) && c2[rc[i]] >= cm2)) {
+            s2[rk[i]]++; c2[rc[i]]++; print r[i]; picked++; taken[i] = 1
+        }
+    for (i = 1; i <= nr && picked < tn; i++)
+        if (!(i in taken)) { print r[i]; picked++ }
+}
+    ' "$WLSEL" > "$FAST_SEL" 2>/dev/null
+rm -f "$WLSEL"
 COLOSEL=$(cut -d'|' -f3 "$FAST_SEL" 2>/dev/null | sort | uniq -c | awk '{printf "%s×%s ", $2, $1}')
 [ -z "$COLOSEL" ] && COLOSEL="（无）"
-echo "[$(date '+%m-%d %H:%M:%S')]快筛候选 $DL_TOPN 个（机场白名单：${COLO_ALLOW:-不限}）：${COLOSEL}" >> "$LOG"
+SEGSEL=$(cut -d'|' -f1 "$FAST_SEL" 2>/dev/null | cut -d: -f1-3 | sort -u | grep -c .)
+echo "[$(date '+%m-%d %H:%M:%S')]快筛候选 $DL_TOPN 个（白名单：${COLO_ALLOW:-不限}；段≤$DIV_SEG_MAX、同机场≤$DIV_COLO_MAX；实际 ${SEGSEL} 个 /48）：${COLOSEL}" >> "$LOG"
 for entry in $(cat "$FAST_SEL" 2>/dev/null | grep .); do
     N=$((N + 1))
     ip="${entry%%|*}"; rest="${entry#*|}"; lat="${rest%%|*}"; colo="${rest##*|}"
@@ -835,41 +862,11 @@ fi
 mv "$FASTTMP.s" "$FASTTMP" 2>/dev/null; rm -f "$FASTTMP.pass"
 echo "[$(date '+%m-%d %H:%M:%S')]快筛淘汰：$FCNT 个有效样本，中位数 $(awk -v v="$MED" 'BEGIN{printf "%.2f", v/1048576}') MB/s，门槛 $(awk -v v="$FLOOR" 'BEGIN{printf "%.2f", v/1048576}') MB/s → 幸存 $KCNT 个，按 ${PICK_MODE} 定序" >> "$LOG"
 
-# ---- 4b. 精测：多样性筛选后前 FAST_TOPN 名每个 DL_RUNS 次 x 9.1MB 取平均 ----
-# 4a-2. 多样性筛选（三级）：同一 /48 最多 DIV_SEG_MAX 条、同地区最多 DIV_COLO_MAX 条
-#       ① 严格约束直选  ② 不足时放宽一档回填（同/48≤3、同地区≤5）
-#       ③ 仍不足时按速度顺位无条件回填（候选地区高度集中时保证名单数量）
+# ---- 4b. 精测：按 PICK_MODE 顺位取前 FAST_TOPN 名（多样性已在 3a 候选阶段生效）----
 FSEL="$V6DIR/.fast.sel"
-# 注意 -F"|"：FASTTMP 行为 speed|lat|ip|colo 竖线分隔（无空格），缺了它 $3/$4 全为空，
-# 筛选会退化成"全部同 key"→ 恒触顶 → 纯速度序（上线首日实际发生的 bug）
-awk -F"|" -v sm="$DIV_SEG_MAX" -v cm="$DIV_COLO_MAX" -v tn="$FAST_TOPN" '
-function key48(ip,   p,nl,nr,L,R) {
-    p = index(ip, "::")
-    if (p > 0) { nl = split(substr(ip,1,p-1), L, ":"); nr = split(substr(ip,p+2), R, ":") }
-    else { nl = split(ip, L, ":"); nr = 0 }
-    return ((nl>=1)?tolower(L[1]):"0") ":" ((nl>=2)?tolower(L[2]):"0") ":" ((nl>=3)?tolower(L[3]):"0")
-}
-{
-    if (picked < tn) {
-        k = key48($3); c = $4
-        if (!((k in sc) && sc[k] >= sm) && !((c in cc) && cc[c] >= cm)) {
-            sc[k]++; cc[c]++; s2[k]++; c2[c]++; print; picked++; next
-        }
-    }
-    rest[++nr] = $0; rkey[nr] = key48($3); rcolo[nr] = $4
-}
-END {
-    sm2 = sm + 1; cm2 = cm + 2
-    for (i = 1; i <= nr && picked < tn; i++)
-        if (!((rkey[i] in s2) && s2[rkey[i]] >= sm2) && !((rcolo[i] in c2) && c2[rcolo[i]] >= cm2)) {
-            s2[rkey[i]]++; c2[rcolo[i]]++; print rest[i]; picked++; taken[i] = 1
-        }
-    for (i = 1; i <= nr && picked < tn; i++)
-        if (!(i in taken)) { print rest[i]; picked++ }
-}
-' "$FASTTMP" > "$FSEL" 2>/dev/null
+head -n "$FAST_TOPN" "$FASTTMP" > "$FSEL" 2>/dev/null
 FSELC=$(grep -c . "$FSEL" 2>/dev/null); [ -z "$FSELC" ] && FSELC=0
-echo "[$(date '+%m-%d %H:%M:%S')]快筛完成：$FCNT 个候选，多样性筛选（同/48≤$DIV_SEG_MAX、同地区≤$DIV_COLO_MAX）后 $FSELC 个进入精测（${DL_RUNS}次x9.1MB）" >> "$LOG"
+echo "[$(date '+%m-%d %H:%M:%S')]快筛完成：$FCNT 个有效样本 → 按 ${PICK_MODE} 顺位取 $FSELC 个进入精测（${DL_RUNS}次x9.1MB）" >> "$LOG"
 if [ "$FSELC" -eq 0 ]; then
     echo "[$(date '+%m-%d %H:%M:%S')]无候选进入精测（快筛全失败），放弃本轮，$RESULT_FILE 保留上次值" >> "$LOG"
     tail -"$LOG_KEEP_LINES" "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"
